@@ -1,0 +1,45 @@
+name: Helm Chart Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pages: write
+      id-token: write
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Helm
+        uses: azure/setup-helm@v3
+        with:
+          version: v3.12.0
+
+      - name: Package Helm chart
+        run: |
+          helm package helm/castai-pdb-controller
+          mv castai-pdb-controller-*.tgz castai-pdb-controller-${{ github.ref_name }}.tgz
+
+      - name: Create Helm repository
+        run: |
+          mkdir -p helm-repo
+          cp castai-pdb-controller-${{ github.ref_name }}.tgz helm-repo/
+          helm repo index helm-repo --url https://castai.github.io/castai-pdb-controller
+
+      - name: Setup Pages
+        uses: actions/configure-pages@v4
+
+      - name: Upload artifact
+        uses: actions/upload-pages-artifact@v3
+        with:
+          path: helm-repo
+
+      - name: Deploy to GitHub Pages
+        id: deployment
+        uses: actions/deploy-pages@v4 

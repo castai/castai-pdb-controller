@@ -12,44 +12,40 @@ The CAST AI PDB Controller automatically creates, updates, and manages PodDisrup
 - Helm 3.0+
 - Cluster admin permissions (for RBAC resources)
 
-## Deployment
+## Installation
 
-### Basic Installation
+### Method 1: Install from GitHub Pages Repository (Recommended)
 
 ```bash
+# Add the CAST AI Helm repository
+helm repo add castai https://castai.github.io/castai-pdb-controller
+
+# Update the repository
+helm repo update
+
+# Install the chart
+helm install castai-pdb-controller castai/castai-pdb-controller
+```
+
+### Method 2: Install from Source
+
+```bash
+# Clone the repository
+git clone https://github.com/castai/castai-pdb-controller.git
+cd castai-pdb-controller
+
 # Install the chart
 helm install castai-pdb-controller ./helm/castai-pdb-controller
 ```
 
-### Installation with Custom Values
+### Method 3: Install with Custom Configuration
 
 ```bash
-# Install with custom namespace
-helm install castai-pdb-controller ./helm/castai-pdb-controller \
-  --set namespace=my-namespace
-
-# Install with custom PDB configuration
-helm install castai-pdb-controller ./helm/castai-pdb-controller \
+# Install with custom PDB settings
+helm install castai-pdb-controller castai/castai-pdb-controller \
   --set config.minAvailable="2" \
-  --set config.fixPoorPDBs=true
-```
-
-### Using Custom Values File
-
-Create a `custom-values.yaml`:
-
-```yaml
-replicaCount: 3
-namespace: my-custom-namespace
-
-config:
-  minAvailable: "2"
-  fixPoorPDBs: "true"
-```
-
-Install with custom values:
-```bash
-helm install castai-pdb-controller ./helm/castai-pdb-controller -f custom-values.yaml
+  --set config.fixPoorPDBs=true \
+  --set namespace=my-namespace
 ```
 
 ## Configuration
