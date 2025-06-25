@@ -2,13 +2,15 @@
 
 A Helm chart for deploying the CAST AI Pod Disruption Budget (PDB) Controller to Kubernetes clusters.
 
+> **Note:** By default, Helm installs charts into the `default` namespace. We recommend installing this chart into the `castai-agent` namespace. All examples below use `-n castai-agent` to ensure the correct namespace is used.
+
 ## Overview
 
 The CAST AI PDB Controller automatically creates, updates, and manages PodDisruptionBudgets for Deployments and StatefulSets in your Kubernetes cluster. It ensures high availability during cluster maintenance and node disruptions.
 
 ## Prerequisites
 
-- Kubernetes 1.19+
+- Kubernetes 1.21+
 - Helm 3.0+
 - Cluster admin permissions (for RBAC resources)
 
@@ -23,8 +25,9 @@ helm repo add castai https://castai.github.io/castai-pdb-controller
 # Update the repository
 helm repo update
 
-# Install the chart
-helm install castai-pdb-controller castai/castai-pdb-controller
+# Install the chart into the castai-agent namespace
+helm install castai-pdb-controller castai/castai-pdb-controller \
+  -n castai-agent
 ```
 
 ### Method 2: Install from Source
@@ -34,18 +37,19 @@ helm install castai-pdb-controller castai/castai-pdb-controller
 git clone https://github.com/castai/castai-pdb-controller.git
 cd castai-pdb-controller
 
-# Install the chart
-helm install castai-pdb-controller ./helm/castai-pdb-controller
+# Install the chart into the castai-agent namespace
+helm install castai-pdb-controller ./helm/castai-pdb-controller \
+  -n castai-agent
 ```
 
 ### Method 3: Install with Custom Configuration
 
 ```bash
-# Install with custom PDB settings
+# Install with custom PDB settings into the castai-agent namespace
 helm install castai-pdb-controller castai/castai-pdb-controller \
   --set config.minAvailable="2" \
   --set config.fixPoorPDBs=true \
-  --set namespace=my-namespace
+  -n castai-agent
 ```
 
 ## Configuration
@@ -118,13 +122,18 @@ kubectl auth can-i create poddisruptionbudgets --as=system:serviceaccount:castai
 ## Upgrading
 
 ```bash
-# Update to a new version
-helm upgrade castai-pdb-controller ./helm/castai-pdb-controller
+# Update the repository
+helm repo update
+
+# Upgrade to a new version in the castai-agent namespace
+helm upgrade castai-pdb-controller castai/castai-pdb-controller \
+  -n castai-agent
 
 # Upgrade with new values
-helm upgrade castai-pdb-controller ./helm/castai-pdb-controller \
+helm upgrade castai-pdb-controller castai/castai-pdb-controller \
   --set image.tag="latest" \
-  --set config.minAvailable="2"
+  --set config.minAvailable="2" \
+  -n castai-agent
 ```
 
 ## Uninstalling
