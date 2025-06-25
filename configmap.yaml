@@ -1,0 +1,13 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: castai-pdb-controller-config
+  namespace: castai-agent
+data:
+  defaultMinAvailable: "1"
+#  defaultMaxUnavailable: "25%"
+  FixPoorPDBs: "false"
+  logInterval: "15m"
+  pdbScanInterval: "2m"
+  garbageCollectInterval: "2m"
+  pdbDumpInterval: "5m"

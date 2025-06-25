@@ -1,0 +1,42 @@
+# Default values for castai-pdb-controller
+# Number of controller replicas to deploy
+replicaCount: 2
+
+# Container image configuration
+image:
+  # Container image repository
+  repository: castai/castai-pdb-controller
+  # Container image tag
+  tag: "latest"
+  # Container image pull policy
+  pullPolicy: IfNotPresent
+
+# Name overrides for the chart
+nameOverride: ""
+fullnameOverride: ""
+
+# ServiceAccount configuration
+serviceAccount:
+  # Create a new service account
+  create: true
+  # Service account name
+  name: "castai-pdb-controller"
+  # Service account annotations (useful for IAM roles, etc.)
+  annotations: {}
+
+# RBAC configuration
+rbac:
+  # Create RBAC resources (ClusterRole and ClusterRoleBinding)
+  create: true
+
+# Controller configuration
+config:
+  # Default minAvailable for PDBs (use either minAvailable or maxUnavailable, not both)
+  minAvailable: "1"
+  # Default maxUnavailable for PDBs (use either minAvailable or maxUnavailable, not both)
+  # maxUnavailable: "50%"  # Optional, use one or the other
+  # Automatically fix poor PDB configurations (true/false)
+  fixPoorPDBs: "false"    # Set to "true" for automatic correction, "false" for logging only
+
+# Target namespace for deployment
+namespace: castai-agent 

@@ -1,0 +1,13 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ include "castai-pdb-controller.fullname" . }}-config
+  namespace: {{ .Values.namespace }}
+  labels:
+    {{- include "castai-pdb-controller.labels" . | nindent 4 }}
+data:
+  minAvailable: {{ .Values.config.minAvailable | quote }}
+  {{- if .Values.config.maxUnavailable }}
+  maxUnavailable: {{ .Values.config.maxUnavailable | quote }}
+  {{- end }}
+  FixPoorPDBs: {{ .Values.config.fixPoorPDBs | quote }} 
