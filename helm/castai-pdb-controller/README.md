@@ -2,7 +2,7 @@
 
 A Helm chart for deploying the CAST AI Pod Disruption Budget (PDB) Controller to Kubernetes clusters.
 
-> **Note:** By default, Helm installs charts into the `default` namespace. We recommend installing this chart into the `castai-agent` namespace. All examples below use `-n castai-agent` to ensure the correct namespace is used.
+> **Note:** By default, Helm installs charts into the `default` namespace. We recommend installing this chart into the `castai-agent` namespace. All examples below use `-n castai-agent --create-namespace` to ensure the correct namespace is used and created if it doesn't exist.
 
 ## Overview
 
@@ -27,7 +27,7 @@ helm repo update
 
 # Install the chart into the castai-agent namespace
 helm install castai-pdb-controller castai/castai-pdb-controller \
-  -n castai-agent
+  -n castai-agent --create-namespace
 ```
 
 ### Method 2: Install from Source
@@ -39,7 +39,7 @@ cd castai-pdb-controller
 
 # Install the chart into the castai-agent namespace
 helm install castai-pdb-controller ./helm/castai-pdb-controller \
-  -n castai-agent
+  -n castai-agent --create-namespace
 ```
 
 ### Method 3: Install with Custom Configuration
@@ -49,7 +49,7 @@ helm install castai-pdb-controller ./helm/castai-pdb-controller \
 helm install castai-pdb-controller castai/castai-pdb-controller \
   --set config.minAvailable="2" \
   --set config.fixPoorPDBs=true \
-  -n castai-agent
+  -n castai-agent --create-namespace
 ```
 
 ## Configuration
