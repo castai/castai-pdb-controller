@@ -31,12 +31,60 @@ rbac:
 
 # Controller configuration
 config:
-  # Default minAvailable for PDBs (use either minAvailable or maxUnavailable, not both)
-  minAvailable: "1"
-  # Default maxUnavailable for PDBs (use either minAvailable or maxUnavailable, not both)
-  # maxUnavailable: "50%"  # Optional, use one or the other
+  # Default minAvailable for PDBs (use either defaultMinAvailable or defaultMaxUnavailable, not both)
+  defaultMinAvailable: "1"
+  # Default maxUnavailable for PDBs (use either defaultMinAvailable or defaultMaxUnavailable, not both)
+  # defaultMaxUnavailable: "50%"  # Optional, use one or the other
   # Automatically fix poor PDB configurations (true/false)
-  fixPoorPDBs: "false"    # Set to "true" for automatic correction, "false" for logging only
+  FixPoorPDBs: "false"    # Set to "true" for automatic correction, "false" for logging only
+  # Log interval for repeated messages (e.g., "15m", "1h")
+  logInterval: "15m"
+  # PDB scan interval (e.g., "2m", "5m")
+  pdbScanInterval: "2m"
+  # Garbage collection interval (e.g., "2m", "5m")
+  garbageCollectInterval: "2m"
+  # PDB dump interval (e.g., "5m", "10m")
+  pdbDumpInterval: "5m"
 
-# Target namespace for deployment
-namespace: castai-agent 
+# Resource configuration
+resources:
+  limits:
+    cpu: 500m
+    memory: 512Mi
+  requests:
+    cpu: 100m
+    memory: 128Mi
+
+# Security context configuration
+securityContext:
+  # Container security context
+  container:
+    allowPrivilegeEscalation: false
+    runAsNonRoot: true
+    runAsUser: 1000
+    capabilities:
+      drop:
+      - ALL
+  # Pod security context
+  pod:
+    fsGroup: 1000
+    runAsNonRoot: true
+    runAsUser: 1000
+
+# Pod configuration
+pod:
+  # Pod annotations
+  annotations: {}
+  # Node selector for pod assignment
+  nodeSelector: {}
+  # Tolerations for pod assignment
+  tolerations: []
+  # Affinity for pod assignment
+  affinity: {}
+
+# Deployment strategy
+strategy:
+  type: RollingUpdate
+  rollingUpdate:
+    maxSurge: 25%
+    maxUnavailable: 25% 
