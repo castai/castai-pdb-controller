@@ -42,32 +42,6 @@ helm install castai-pdb-controller castai/castai-pdb-controller \
   -n castai-agent --create-namespace
 ```
 
-#### Custom Configuration
-```bash
-# Install with custom PDB settings
-helm install castai-pdb-controller castai/castai-pdb-controller \
-  --set config.defaultMinAvailable="2" \
-  --set config.FixPoorPDBs=true \
-  --set config.logInterval="10m" \
-  -n castai-agent --create-namespace
-```
-
-#### Production Installation
-```bash
-# Install with production-ready settings
-helm install castai-pdb-controller castai/castai-pdb-controller \
-  --set replicaCount=3 \
-  --set resources.limits.cpu=1000m \
-  --set resources.limits.memory=1Gi \
-  --set resources.requests.cpu=200m \
-  --set resources.requests.memory=256Mi \
-  --set config.defaultMinAvailable="1" \
-  --set config.FixPoorPDBs=true \
-  --set config.pdbScanInterval="1m" \
-  --set config.garbageCollectInterval="5m" \
-  -n castai-agent --create-namespace
-```
-
 ## Configuration
 
 ### Values Reference
@@ -257,23 +231,11 @@ kubectl get clusterrolebinding castai-pdb-controller
 ## Upgrading
 
 ```bash
-# Update the repository
-helm repo update
-
 # Upgrade to a new version
 helm upgrade castai-pdb-controller castai/castai-pdb-controller \
   -n castai-agent
 
-# Upgrade with new values
-helm upgrade castai-pdb-controller castai/castai-pdb-controller \
-  --set image.tag="latest" \
-  --set config.defaultMinAvailable="2" \
-  --set config.FixPoorPDBs=true \
-  -n castai-agent
-```
-
 ## Uninstalling
-
 ```bash
 # Uninstall the chart
 helm uninstall castai-pdb-controller -n castai-agent
@@ -281,26 +243,6 @@ helm uninstall castai-pdb-controller -n castai-agent
 # Remove RBAC resources (if not managed by Helm)
 kubectl delete clusterrole castai-pdb-controller
 kubectl delete clusterrolebinding castai-pdb-controller
-
-# Remove the namespace (optional)
-kubectl delete namespace castai-agent
-```
-
-## Development
-
-### Local Testing
-
-```bash
-# Package the chart
-helm package helm/castai-pdb-controller
-
-# Lint the chart
-helm lint helm/castai-pdb-controller
-
-# Template rendering test
-helm template castai-pdb-controller helm/castai-pdb-controller \
-  --set config.defaultMinAvailable="2" \
-  --set config.FixPoorPDBs=true
 ```
 
 ## Support
