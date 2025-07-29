@@ -1,0 +1,16 @@
+apiVersion: v1
+entries:
+  castai-pdb-controller:
+  - apiVersion: v2
+    appVersion: 0.1.0
+    created: "2025-07-29T17:30:59.244427+05:30"
+    description: A Helm chart for CAST AI PDB Controller
+    digest: 541afc7e44de7b36b38ddf30f49d90bd3ba2814c273aa7c9e8a5025b52016b19
+    maintainers:
+    - name: CAST AI
+    name: castai-pdb-controller
+    type: application
+    urls:
+    - https://castai.github.io/castai-pdb-controller/castai-pdb-controller-0.1.0.tgz
+    version: 0.1.0
+generated: "2025-07-29T17:30:59.243825+05:30"
