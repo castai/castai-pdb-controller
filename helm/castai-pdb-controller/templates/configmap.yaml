@@ -6,17 +6,14 @@ metadata:
   labels:
     {{- include "castai-pdb-controller.labels" . | nindent 4 }}
 data:
-  {{- if .Values.config.defaultMinAvailable }}
   {{- $minAvailable := toString .Values.config.defaultMinAvailable }}
-  {{- if and (ne $minAvailable "") (ne $minAvailable "null") (ne $minAvailable "<nil>") }}
-  defaultMinAvailable: {{ .Values.config.defaultMinAvailable | quote }}
-  {{- end }}
-  {{- end }}
-  {{- if .Values.config.defaultMaxUnavailable }}
   {{- $maxUnavailable := toString .Values.config.defaultMaxUnavailable }}
-  {{- if and (ne $maxUnavailable "") (ne $maxUnavailable "null") (ne $maxUnavailable "<nil>") }}
+  {{- $minAvailableValid := and (ne $minAvailable "") (ne $minAvailable "null") (ne $minAvailable "<nil>") }}
+  {{- $maxUnavailableValid := and (ne $maxUnavailable "") (ne $maxUnavailable "null") (ne $maxUnavailable "<nil>") }}
+  {{- if $maxUnavailableValid }}
   defaultMaxUnavailable: {{ .Values.config.defaultMaxUnavailable | quote }}
-  {{- end }}
+  {{- else if $minAvailableValid }}
+  defaultMinAvailable: {{ .Values.config.defaultMinAvailable | quote }}
   {{- end }}
   FixPoorPDBs: {{ .Values.config.FixPoorPDBs | quote }}
   logInterval: {{ .Values.config.logInterval | quote }}
