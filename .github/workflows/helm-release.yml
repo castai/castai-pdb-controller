@@ -1,15 +1,13 @@
 name: Helm Chart Release
 
 on:
-  release:
-    types: [published]
+  push:
+    tags:
+      - 'v*'
 
 jobs:
   release:
     runs-on: ubuntu-latest
-    environment:
-      name: github-pages
-      url: ${{ steps.deployment.outputs.page_url }}
     permissions:
       contents: read
       pages: write
@@ -26,12 +24,12 @@ jobs:
       - name: Package Helm chart
         run: |
           helm package helm/castai-pdb-controller
-          mv castai-pdb-controller-*.tgz castai-pdb-controller-${{ github.event.release.tag_name }}.tgz
+          mv castai-pdb-controller-*.tgz castai-pdb-controller-${{ github.ref_name }}.tgz
 
       - name: Create Helm repository
         run: |
           mkdir -p helm-repo
-          cp castai-pdb-controller-${{ github.event.release.tag_name }}.tgz helm-repo/
+          cp castai-pdb-controller-${{ github.ref_name }}.tgz helm-repo/
           helm repo index helm-repo --url https://castai.github.io/castai-pdb-controller
 
       - name: Setup Pages
