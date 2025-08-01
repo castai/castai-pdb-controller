@@ -37,8 +37,13 @@ helm install castai-pdb-controller castai/castai-pdb-controller \
 
 #### Basic Installation
 ```bash
-# Install with default settings
+# Install with default settings (no default PDB configuration)
 helm install castai-pdb-controller castai/castai-pdb-controller \
+  -n castai-agent --create-namespace
+
+# Install with minAvailable mode enabled
+helm install castai-pdb-controller castai/castai-pdb-controller \
+  --set config.defaultMinAvailable="1" \
   -n castai-agent --create-namespace
 ```
 
@@ -58,8 +63,8 @@ helm install castai-pdb-controller castai/castai-pdb-controller \
 | `serviceAccount.name` | Service account name | `"castai-pdb-controller"` |
 | `serviceAccount.annotations` | Service account annotations | `{}` |
 | `rbac.create` | Create RBAC resources | `true` |
-| `config.defaultMinAvailable` | Default minAvailable for PDBs | `"1"` |
-| `config.defaultMaxUnavailable` | Default maxUnavailable for PDBs | `""` (unset) |
+| `config.defaultMinAvailable` | Default minAvailable for PDBs | `null` (unset) |
+| `config.defaultMaxUnavailable` | Default maxUnavailable for PDBs | `null` (unset) |
 | `config.FixPoorPDBs` | Automatically fix poor PDB configurations | `"false"` |
 | `config.logInterval` | Log interval for repeated messages | `"15m"` |
 | `config.pdbScanInterval` | PDB scan interval | `"2m"` |
@@ -80,77 +85,59 @@ helm install castai-pdb-controller castai/castai-pdb-controller \
 
 ### PDB Configuration
 
-The controller supports two PDB configuration modes:
+The controller supports two PDB configuration modes. By default, neither is set, giving you full flexibility to choose your preferred mode.
 
-#### MinAvailable Mode (Default)
+#### MinAvailable Mode
 ```yaml
 config:
   defaultMinAvailable: "1"  # Ensures at least 1 pod is always available
+  # or
+  defaultMinAvailable: "50%"  # Ensures at least 50% of pods are always available
 ```
 
 #### MaxUnavailable Mode
 ```yaml
 config:
+  defaultMaxUnavailable: "1"  # Allows at most 1 pod to be unavailable
+  # or
   defaultMaxUnavailable: "50%"  # Allows up to 50% of pods to be unavailable
 ```
 
-**Note**: Use either `defaultMinAvailable` or `defaultMaxUnavailable`, not both.
-
-### Advanced Configuration Examples
-
-#### Custom Resource Limits
+#### Disabling Default PDB Configuration
 ```yaml
-resources:
-  limits:
-    cpu: 1000m
-    memory: 1Gi
-  requests:
-    cpu: 200m
-    memory: 256Mi
+config:
+  defaultMinAvailable: null  # or "" or omit entirely
+  defaultMaxUnavailable: null  # or "" or omit entirely
 ```
 
-#### Custom Security Context
-```yaml
-securityContext:
-  container:
-    allowPrivilegeEscalation: false
-    runAsNonRoot: true
-    runAsUser: 1000
-    capabilities:
-      drop: ["ALL"]
-  pod:
-    fsGroup: 1000
-    runAsNonRoot: true
-    runAsUser: 1000
-```
+**Note**: Use either `defaultMinAvailable` or `defaultMaxUnavailable`, not both. If both are set, the controller will log an error and ignore both values.
 
-#### Node Affinity and Tolerations
-```yaml
-pod:
-  nodeSelector:
-    node-role.kubernetes.io/worker: "true"
-  tolerations:
-    - key: "node-role.kubernetes.io/control-plane"
-      operator: "Exists"
-      effect: "NoSchedule"
-  affinity:
-    nodeAffinity:
-      requiredDuringSchedulingIgnoredDuringExecution:
-        nodeSelectorTerms:
-        - matchExpressions:
-          - key: node-role.kubernetes.io/worker
-            operator: In
-            values:
-            - "true"
-```
+### Using Helm --set Flag
 
-#### Custom Deployment Strategy
-```yaml
-strategy:
-  type: RollingUpdate
-  rollingUpdate:
-    maxSurge: 50%
-    maxUnavailable: 0
+You can use Helm's `--set` flag to override PDB configuration:
+
+```bash
+# Set minAvailable mode
+helm install castai-pdb-controller castai/castai-pdb-controller \
+  --set config.defaultMinAvailable="1" \
+  -n castai-agent --create-namespace
+
+# Set maxUnavailable mode
+helm install castai-pdb-controller castai/castai-pdb-controller \
+  --set config.defaultMaxUnavailable="50%" \
+  -n castai-agent --create-namespace
+
+# Unset minAvailable (use maxUnavailable instead)
+helm install castai-pdb-controller castai/castai-pdb-controller \
+  --set config.defaultMinAvailable=null \
+  --set config.defaultMaxUnavailable="25%" \
+  -n castai-agent --create-namespace
+
+# Disable default PDB configuration entirely
+helm install castai-pdb-controller castai/castai-pdb-controller \
+  --set config.defaultMinAvailable=null \
+  --set config.defaultMaxUnavailable=null \
+  -n castai-agent --create-namespace
 ```
 
 ## Usage
@@ -236,13 +223,39 @@ helm upgrade castai-pdb-controller castai/castai-pdb-controller \
   -n castai-agent
 
 ## Uninstalling
+
+### Quick Uninstall
 ```bash
-# Uninstall the chart
+# Uninstall the chart (removes deployment, service account, and configmap)
 helm uninstall castai-pdb-controller -n castai-agent
 
-# Remove RBAC resources (if not managed by Helm)
+# Remove RBAC resources
 kubectl delete clusterrole castai-pdb-controller
 kubectl delete clusterrolebinding castai-pdb-controller
+```
+
+### Complete Cleanup (Optional)
+If you want to remove everything including the PDBs created by the controller:
+
+```bash
+# Remove PDBs created by the controller (by name pattern)
+kubectl get poddisruptionbudget --all-namespaces -o custom-columns="NAMESPACE:.metadata.namespace,NAME:.metadata.name" \
+  | awk '$2 ~ /^castai-.*-pdb$/ {print "kubectl delete poddisruptionbudget -n " $1 " " $2}' \
+  | sh
+
+# Alternative: Remove specific CAST AI PDBs
+kubectl delete pdb castai-test-pdb-pdb -n castai-agent
+kubectl delete pdb castai-myapp-pdb -n my-namespace
+
+# Remove namespace (if no other CAST AI components)
+kubectl delete namespace castai-agent
+```
+
+**Note**: PDBs created by the controller will continue to protect your workloads even after uninstallation. Only remove them if you no longer need this protection.
+
+**Identifying CAST AI PDBs**: The controller creates PDBs with the naming pattern `castai-{workload-name}-pdb`. You can list all CAST AI PDBs with:
+```bash
+kubectl get pdb -A | grep "^castai-.*-pdb"
 ```
 
 ## Support

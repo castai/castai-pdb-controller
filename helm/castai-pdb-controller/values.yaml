@@ -32,9 +32,13 @@ rbac:
 # Controller configuration
 config:
   # Default minAvailable for PDBs (use either defaultMinAvailable or defaultMaxUnavailable, not both)
-  defaultMinAvailable: "1"
+  # Set to null, "", or omit to disable minAvailable mode
+  # Examples: "1", "50%", null, ""
+  defaultMinAvailable: null
   # Default maxUnavailable for PDBs (use either defaultMinAvailable or defaultMaxUnavailable, not both)
-  # defaultMaxUnavailable: "50%"  # Optional, use one or the other
+  # Set to null, "", or omit to disable maxUnavailable mode
+  # Examples: "1", "50%", null, ""
+  defaultMaxUnavailable: null
   # Automatically fix poor PDB configurations (true/false)
   FixPoorPDBs: "false"    # Set to "true" for automatic correction, "false" for logging only
   # Log interval for repeated messages (e.g., "15m", "1h")
