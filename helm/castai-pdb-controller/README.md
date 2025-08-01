@@ -117,20 +117,23 @@ config:
 You can use Helm's `--set` flag to override PDB configuration:
 
 ```bash
-# Set minAvailable mode
+# Set minAvailable mode (default behavior)
 helm install castai-pdb-controller castai/castai-pdb-controller \
   --set config.defaultMinAvailable="1" \
   -n castai-agent --create-namespace
 
-# Set maxUnavailable mode
+# Set maxUnavailable mode (explicitly unset minAvailable)
 helm install castai-pdb-controller castai/castai-pdb-controller \
   --set config.defaultMaxUnavailable="50%" \
+  --set config.defaultMinAvailable=null \
   -n castai-agent --create-namespace
 
 # Use defaults (minAvailable: "1" - automatic PDB creation)
 helm install castai-pdb-controller castai/castai-pdb-controller \
   -n castai-agent --create-namespace
 ```
+
+**Important**: When switching from minAvailable to maxUnavailable mode, you must explicitly unset minAvailable using `=null`. When switching from maxUnavailable to minAvailable mode, the template automatically handles the switch. This is due to the template's priority logic where minAvailable takes precedence.
 
 ## Usage
 
