@@ -63,7 +63,7 @@ helm install castai-pdb-controller castai/castai-pdb-controller \
 | `serviceAccount.name` | Service account name | `"castai-pdb-controller"` |
 | `serviceAccount.annotations` | Service account annotations | `{}` |
 | `rbac.create` | Create RBAC resources | `true` |
-| `config.defaultMinAvailable` | Default minAvailable for PDBs | `null` (unset) |
+| `config.defaultMinAvailable` | Default minAvailable for PDBs | `"1"` (automatic PDB creation) |
 | `config.defaultMaxUnavailable` | Default maxUnavailable for PDBs | `null` (unset) |
 | `config.FixPoorPDBs` | Automatically fix poor PDB configurations | `"false"` |
 | `config.logInterval` | Log interval for repeated messages | `"15m"` |
@@ -85,7 +85,7 @@ helm install castai-pdb-controller castai/castai-pdb-controller \
 
 ### PDB Configuration
 
-The controller supports two PDB configuration modes. By default, neither is set, giving you full flexibility to choose your preferred mode.
+The controller supports two PDB configuration modes. By default, `minAvailable: "1"` is enabled for automatic PDB creation.
 
 #### MinAvailable Mode
 ```yaml
@@ -110,7 +110,7 @@ config:
   defaultMaxUnavailable: null  # or "" or omit entirely
 ```
 
-**Note**: Use either `defaultMinAvailable` or `defaultMaxUnavailable`, not both. If both are set, the controller will log an error and ignore both values.
+**Note**: Use either `defaultMinAvailable` or `defaultMaxUnavailable`, not both. If both are set, `defaultMinAvailable` takes precedence. The template ensures only one value is present in the ConfigMap.
 
 ### Using Helm --set Flag
 
@@ -127,16 +127,8 @@ helm install castai-pdb-controller castai/castai-pdb-controller \
   --set config.defaultMaxUnavailable="50%" \
   -n castai-agent --create-namespace
 
-# Unset minAvailable (use maxUnavailable instead)
+# Use defaults (minAvailable: "1" - automatic PDB creation)
 helm install castai-pdb-controller castai/castai-pdb-controller \
-  --set config.defaultMinAvailable=null \
-  --set config.defaultMaxUnavailable="25%" \
-  -n castai-agent --create-namespace
-
-# Disable default PDB configuration entirely
-helm install castai-pdb-controller castai/castai-pdb-controller \
-  --set config.defaultMinAvailable=null \
-  --set config.defaultMaxUnavailable=null \
   -n castai-agent --create-namespace
 ```
 

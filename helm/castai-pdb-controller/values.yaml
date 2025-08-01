@@ -34,7 +34,7 @@ config:
   # Default minAvailable for PDBs (use either defaultMinAvailable or defaultMaxUnavailable, not both)
   # Set to null, "", or omit to disable minAvailable mode
   # Examples: "1", "50%", null, ""
-  defaultMinAvailable: null
+  defaultMinAvailable: "1"
   # Default maxUnavailable for PDBs (use either defaultMinAvailable or defaultMaxUnavailable, not both)
   # Set to null, "", or omit to disable maxUnavailable mode
   # Examples: "1", "50%", null, ""
