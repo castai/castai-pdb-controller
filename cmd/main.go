@@ -7,6 +7,7 @@ import (
 	"log"
 	"os"
 	"os/signal"
+	"regexp"
 	"strconv"
 	"strings"
 	"sync"
@@ -43,6 +44,12 @@ const (
 	pdbDumpFile                   = "/tmp/castai-pdbs.yaml"
 )
 
+type ExclusionRule struct {
+	NamespaceRegex string            `yaml:"namespaceRegex"`
+	NameRegex      string            `yaml:"nameRegex"`
+	Labels         map[string]string `yaml:"labels"`
+}
+
 type DefaultPDBConfig struct {
 	MinAvailable           *intstr.IntOrString
 	MaxUnavailable         *intstr.IntOrString
@@ -51,6 +58,7 @@ type DefaultPDBConfig struct {
 	PDBScanInterval        time.Duration
 	GarbageCollectInterval time.Duration
 	PDBDumpInterval        time.Duration
+	Exclusions             []ExclusionRule
 }
 
 var (
@@ -64,6 +72,131 @@ var (
 	fixLogTimes      = make(map[string]time.Time)
 	fixLogTimesLock  sync.Mutex
 )
+
+// isWorkloadExcluded checks if a workload should be excluded from PDB creation based on exclusion rules
+func isWorkloadExcluded(namespace, name string, labels map[string]string) bool {
+	defaultPDBConfigLock.RLock()
+	exclusions := defaultPDBConfig.Exclusions
+	defaultPDBConfigLock.RUnlock()
+
+	for _, rule := range exclusions {
+		// Check namespace regex
+		if rule.NamespaceRegex != "" {
+			matched, err := regexp.MatchString(rule.NamespaceRegex, namespace)
+			if err != nil || !matched {
+				continue
+			}
+		}
+
+		// Check name regex
+		if rule.NameRegex != "" {
+			matched, err := regexp.MatchString(rule.NameRegex, name)
+			if err != nil || !matched {
+				continue
+			}
+		}
+
+		// Check labels
+		if len(rule.Labels) > 0 {
+			allLabelsMatch := true
+			for key, valuePattern := range rule.Labels {
+				if labelValue, exists := labels[key]; exists {
+					matched, err := regexp.MatchString(valuePattern, labelValue)
+					if err != nil || !matched {
+						allLabelsMatch = false
+						break
+					}
+				} else {
+					allLabelsMatch = false
+					break
+				}
+			}
+			if !allLabelsMatch {
+				continue
+			}
+		}
+
+		// If we get here, all criteria matched
+		return true
+	}
+
+	return false
+}
+
+// updateExistingPDB updates an existing castai PDB with new configuration
+func updateExistingPDB(ctx context.Context, clientset *kubernetes.Clientset, existingPDB *policyv1.PodDisruptionBudget, workloadAnnotations map[string]string, replicas *int32, namespace, name string, obj interface{}) {
+	// Parse PDB configuration from annotations or defaults
+	var minAvailable, maxUnavailable *intstr.IntOrString
+	var needsUpdate bool
+
+	if workloadAnnotations != nil {
+		if val, ok := workloadAnnotations[annotationMinAvailable]; ok {
+			minAvailable = parsePDBValue(val)
+		}
+		if val, ok := workloadAnnotations[annotationMaxUnavailable]; ok {
+			maxUnavailable = parsePDBValue(val)
+		}
+	}
+
+	// If no annotation is set, use defaults from ConfigMap
+	if minAvailable == nil && maxUnavailable == nil {
+		defaultPDBConfigLock.RLock()
+		minAvailable = defaultPDBConfig.MinAvailable
+		maxUnavailable = defaultPDBConfig.MaxUnavailable
+		defaultPDBConfigLock.RUnlock()
+	}
+
+	// Validate that only one is set
+	if minAvailable != nil && maxUnavailable != nil {
+		log.Printf("Invalid PDB config for %s/%s: both minAvailable and maxUnavailable set, using minAvailable\n", namespace, name)
+		maxUnavailable = nil
+	}
+
+	// Create PDB spec
+	pdbSpec := policyv1.PodDisruptionBudgetSpec{
+		Selector: existingPDB.Spec.Selector,
+	}
+
+	if minAvailable != nil {
+		pdbSpec.MinAvailable = minAvailable
+	} else if maxUnavailable != nil {
+		pdbSpec.MaxUnavailable = maxUnavailable
+	}
+
+	// Check if update is needed
+	if existingPDB.Spec.MinAvailable == nil && pdbSpec.MinAvailable != nil {
+		needsUpdate = true
+	} else if existingPDB.Spec.MinAvailable != nil && pdbSpec.MinAvailable == nil {
+		needsUpdate = true
+	} else if existingPDB.Spec.MinAvailable != nil && pdbSpec.MinAvailable != nil {
+		if existingPDB.Spec.MinAvailable.String() != pdbSpec.MinAvailable.String() {
+			needsUpdate = true
+		}
+	}
+
+	if existingPDB.Spec.MaxUnavailable == nil && pdbSpec.MaxUnavailable != nil {
+		needsUpdate = true
+	} else if existingPDB.Spec.MaxUnavailable != nil && pdbSpec.MaxUnavailable == nil {
+		needsUpdate = true
+	} else if existingPDB.Spec.MaxUnavailable != nil && pdbSpec.MaxUnavailable != nil {
+		if existingPDB.Spec.MaxUnavailable.String() != pdbSpec.MaxUnavailable.String() {
+			needsUpdate = true
+		}
+	}
+
+	if needsUpdate {
+		existingPDB.Spec = pdbSpec
+		_, err := clientset.PolicyV1().PodDisruptionBudgets(namespace).Update(ctx, existingPDB, metav1.UpdateOptions{})
+		if err != nil {
+			log.Printf("Failed to update PDB for %s/%s: %v\n", namespace, name, err)
+		} else {
+			log.Printf("Updated PDB for %s/%s\n", namespace, name)
+			if replicas != nil {
+				logAndFixPoorPDBConfig(ctx, clientset, existingPDB, name, *replicas, namespace, obj)
+			}
+		}
+	}
+}
 
 // parseDurationFromConfigMap parses a duration string from the ConfigMap (e.g., "5m", "30s") and returns a time.Duration.
 // Falls back to the provided default if the value is missing or invalid.
@@ -139,7 +272,24 @@ func main() {
 	// Silence logs in all pods until leadership is acquired
 	log.SetOutput(io.Discard)
 
+	// Initialize default config first to prevent panics
+	resetDefaultPDBConfig()
+
+	// Load config and ensure it's properly initialized before starting leader election
 	loadDefaultPDBConfig(ctx, clientset)
+
+	// Double-check that config is properly initialized
+	defaultPDBConfigLock.RLock()
+	pdbScanInterval := defaultPDBConfig.PDBScanInterval
+	garbageCollectInterval := defaultPDBConfig.GarbageCollectInterval
+	pdbDumpInterval := defaultPDBConfig.PDBDumpInterval
+	defaultPDBConfigLock.RUnlock()
+
+	if pdbScanInterval <= 0 || garbageCollectInterval <= 0 || pdbDumpInterval <= 0 {
+		log.Printf("WARNING: Config not properly initialized, resetting again")
+		resetDefaultPDBConfig()
+	}
+
 	go watchConfigMap(ctx, clientset)
 
 	// Scan all existing PDBs for poor configuration at startup
@@ -296,6 +446,16 @@ func updateDefaultPDBConfig(cm *corev1.ConfigMap, clientset *kubernetes.Clientse
 	garbageCollectInterval := parseDurationFromConfigMap(cm.Data, "garbageCollectInterval", defaultGarbageCollectInterval)
 	pdbDumpInterval := parseDurationFromConfigMap(cm.Data, "pdbDumpInterval", defaultPDBDumpInterval)
 
+	// Parse exclusion rules from ConfigMap
+	var exclusions []ExclusionRule
+	if exclusionYAML, ok := cm.Data["exclusions"]; ok && exclusionYAML != "" {
+		err := yaml.Unmarshal([]byte(exclusionYAML), &exclusions)
+		if err != nil {
+			log.Printf("Warning: failed to parse exclusions from ConfigMap: %v\n", err)
+			exclusions = []ExclusionRule{}
+		}
+	}
+
 	defaultPDBConfigLock.Lock()
 	defaultPDBConfig.MinAvailable = minAvailable
 	defaultPDBConfig.MaxUnavailable = maxUnavailable
@@ -304,12 +464,13 @@ func updateDefaultPDBConfig(cm *corev1.ConfigMap, clientset *kubernetes.Clientse
 	defaultPDBConfig.PDBScanInterval = pdbScanInterval
 	defaultPDBConfig.GarbageCollectInterval = garbageCollectInterval
 	defaultPDBConfig.PDBDumpInterval = pdbDumpInterval
+	defaultPDBConfig.Exclusions = exclusions
 	defaultPDBConfigLock.Unlock()
 
 	log.Printf("Default PDB config updated from ConfigMap: defaultMinAvailable=%v, defaultMaxUnavailable=%v, FixPoorPDBs=%v, "+
-		"logInterval=%v, pdbScanInterval=%v, garbageCollectInterval=%v, pdbDumpInterval=%v\n",
+		"logInterval=%v, pdbScanInterval=%v, garbageCollectInterval=%v, pdbDumpInterval=%v, exclusions=%d rules\n",
 		minAvailable, maxUnavailable, fixPoorPDBs, logInterval, pdbScanInterval,
-		garbageCollectInterval, pdbDumpInterval)
+		garbageCollectInterval, pdbDumpInterval, len(exclusions))
 
 	// Reconcile all PDBs that use defaults
 	go reconcileAllDefaultPDBs(context.Background(), clientset)
@@ -335,6 +496,7 @@ func loadDefaultPDBConfig(ctx context.Context, clientset *kubernetes.Clientset) 
 	cm, err := clientset.CoreV1().ConfigMaps(configMapNamespace).Get(ctx, configMapName, metav1.GetOptions{})
 	if err != nil {
 		log.Printf("Warning: could not load default PDB config, using built-in defaults: %v\n", err)
+		resetDefaultPDBConfig()
 		return
 	}
 	updateDefaultPDBConfig(cm, clientset)
@@ -363,6 +525,13 @@ func runController(ctx context.Context, clientset *kubernetes.Clientset) {
 		defaultPDBConfigLock.RLock()
 		interval := defaultPDBConfig.PDBScanInterval
 		defaultPDBConfigLock.RUnlock()
+
+		// Safety check: ensure interval is positive
+		if interval <= 0 {
+			log.Printf("WARNING: PDBScanInterval is %v, using default %v", interval, defaultPDBScanInterval)
+			interval = defaultPDBScanInterval
+		}
+
 		ticker := time.NewTicker(interval)
 		defer ticker.Stop()
 		for {
@@ -390,6 +559,12 @@ func runController(ctx context.Context, clientset *kubernetes.Clientset) {
 		defaultPDBConfigLock.RLock()
 		interval := defaultPDBConfig.GarbageCollectInterval
 		defaultPDBConfigLock.RUnlock()
+
+		// Safety check: ensure interval is positive
+		if interval <= 0 {
+			interval = defaultGarbageCollectInterval
+		}
+
 		garbageCollectOrphanedPDBs(ctx, clientset)
 		ticker := time.NewTicker(interval)
 		defer ticker.Stop()
@@ -417,6 +592,12 @@ func runController(ctx context.Context, clientset *kubernetes.Clientset) {
 		defaultPDBConfigLock.RLock()
 		interval := defaultPDBConfig.PDBDumpInterval
 		defaultPDBConfigLock.RUnlock()
+
+		// Safety check: ensure interval is positive
+		if interval <= 0 {
+			interval = defaultPDBDumpInterval
+		}
+
 		dumpCastaiPDBsToFile(ctx, clientset)
 		ticker := time.NewTicker(interval)
 		defer ticker.Stop()
@@ -655,6 +836,11 @@ func createPDBForWorkload(ctx context.Context, clientset *kubernetes.Clientset, 
 		workloadAnnotations = workload.Annotations
 		namespace = workload.Namespace
 		name = workload.Name
+
+		// Check if workload should be excluded
+		if isWorkloadExcluded(namespace, name, workload.Labels) {
+			return
+		}
 	case *appsv1.StatefulSet:
 		replicas = workload.Spec.Replicas
 		if replicas == nil || *replicas < 2 {
@@ -669,6 +855,11 @@ func createPDBForWorkload(ctx context.Context, clientset *kubernetes.Clientset, 
 		workloadAnnotations = workload.Annotations
 		namespace = workload.Namespace
 		name = workload.Name
+
+		// Check if workload should be excluded
+		if isWorkloadExcluded(namespace, name, workload.Labels) {
+			return
+		}
 	default:
 		return
 	}
@@ -689,39 +880,59 @@ func createPDBForWorkload(ctx context.Context, clientset *kubernetes.Clientset, 
 		return
 	}
 
-	    defaultPDBConfigLock.RLock()
-    logInterval := defaultPDBConfig.LogInterval
-    defaultPDBConfigLock.RUnlock()
+	defaultPDBConfigLock.RLock()
+	logInterval := defaultPDBConfig.LogInterval
+	defaultPDBConfigLock.RUnlock()
 
-	    for _, pdb := range pdbList.Items {
-        if pdb.Spec.Selector != nil {
-            pdbSel, err := metav1.LabelSelectorAsSelector(pdb.Spec.Selector)
-            if err == nil && workloadSel.String() == pdbSel.String() {
-                // SIMPLE FIX: If ANY PDB exists for this workload, skip creation
-                key := fmt.Sprintf("%s/%s", namespace, name)
-                now := time.Now()
-                skipLogTimesLock.Lock()
-                last, ok := skipLogTimes[key]
-                if !ok || now.Sub(last) > logInterval {
-                    log.Printf("Skipping PDB creation for %s/%s: existing PDB %s found", namespace, name, pdb.Name)
-                    skipLogTimes[key] = now
-                }
-                skipLogTimesLock.Unlock()
-                return // Return immediately - no PDB creation needed
-            }
-        }
-    }
+	// Check for existing PDBs and handle accordingly
+	var existingCastaiPDB *policyv1.PodDisruptionBudget
+	var existingNonCastaiPDB *policyv1.PodDisruptionBudget
 
-	// No existing PDB found, continue with creation
-	time.Sleep(3 * time.Second)
+	for _, pdb := range pdbList.Items {
+		if pdb.Spec.Selector != nil {
+			pdbSel, err := metav1.LabelSelectorAsSelector(pdb.Spec.Selector)
+			if err == nil && workloadSel.String() == pdbSel.String() {
+				if strings.HasPrefix(pdb.Name, "castai-") {
+					existingCastaiPDB = &pdb
+				} else {
+					existingNonCastaiPDB = &pdb
+				}
+			}
+		}
+	}
 
-	// Double-check for a matching PDB after the delay
+	// If a non-castai PDB exists, skip creation to avoid conflicts
+	if existingNonCastaiPDB != nil {
+		key := fmt.Sprintf("%s/%s", namespace, name)
+		now := time.Now()
+		skipLogTimesLock.Lock()
+		last, ok := skipLogTimes[key]
+		if !ok || now.Sub(last) > logInterval {
+			log.Printf("Skipping PDB creation for %s/%s: existing non-castai PDB %s found", namespace, name, existingNonCastaiPDB.Name)
+			skipLogTimes[key] = now
+		}
+		skipLogTimesLock.Unlock()
+		return
+	}
+
+	// If a castai PDB exists, update it
+	if existingCastaiPDB != nil {
+		updateExistingPDB(ctx, clientset, existingCastaiPDB, workloadAnnotations, replicas, namespace, name, obj)
+		return
+	}
+
+	// No existing PDB found, add delay and double-check to handle race conditions
+	time.Sleep(10 * time.Second)
+
+	// Final check for any PDB that might have been created during the delay
 	pdbListAfter, err := clientset.PolicyV1().PodDisruptionBudgets(namespace).List(ctx, metav1.ListOptions{})
 	if err == nil {
 		for _, pdb := range pdbListAfter.Items {
 			if pdb.Spec.Selector != nil {
 				pdbSel, err := metav1.LabelSelectorAsSelector(pdb.Spec.Selector)
 				if err == nil && workloadSel.String() == pdbSel.String() {
+					// Found a PDB that was created after our initial check, skip creation
+					log.Printf("Skipping PDB creation for %s/%s: PDB %s was created after initial check", namespace, name, pdb.Name)
 					return
 				}
 			}
