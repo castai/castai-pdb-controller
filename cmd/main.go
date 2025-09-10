@@ -83,7 +83,11 @@ func isWorkloadExcluded(namespace, name string, labels map[string]string) bool {
 		// Check namespace regex
 		if rule.NamespaceRegex != "" {
 			matched, err := regexp.MatchString(rule.NamespaceRegex, namespace)
-			if err != nil || !matched {
+			if err != nil {
+				log.Printf("Warning: Invalid namespace regex '%s' in exclusion rule: %v", rule.NamespaceRegex, err)
+				continue
+			}
+			if !matched {
 				continue
 			}
 		}
@@ -91,7 +95,11 @@ func isWorkloadExcluded(namespace, name string, labels map[string]string) bool {
 		// Check name regex
 		if rule.NameRegex != "" {
 			matched, err := regexp.MatchString(rule.NameRegex, name)
-			if err != nil || !matched {
+			if err != nil {
+				log.Printf("Warning: Invalid name regex '%s' in exclusion rule: %v", rule.NameRegex, err)
+				continue
+			}
+			if !matched {
 				continue
 			}
 		}
@@ -102,7 +110,12 @@ func isWorkloadExcluded(namespace, name string, labels map[string]string) bool {
 			for key, valuePattern := range rule.Labels {
 				if labelValue, exists := labels[key]; exists {
 					matched, err := regexp.MatchString(valuePattern, labelValue)
-					if err != nil || !matched {
+					if err != nil {
+						log.Printf("Warning: Invalid label value regex '%s' for key '%s' in exclusion rule: %v", valuePattern, key, err)
+						allLabelsMatch = false
+						break
+					}
+					if !matched {
 						allLabelsMatch = false
 						break
 					}
