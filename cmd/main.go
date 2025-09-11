@@ -1159,13 +1159,20 @@ func reconcileAllDefaultPDBs(ctx context.Context, clientset *kubernetes.Clientse
 			log.Printf("Failed to list Deployments in namespace %s: %v", ns.Name, err)
 		} else {
 			for _, d := range deployments.Items {
+				log.Printf("DEBUG: Reconciliation: Checking deployment %s/%s", d.Namespace, d.Name)
 				if !hasCustomPDBAnnotations(d.Annotations) &&
 					!hasBypassAnnotation(d.Annotations) &&
 					d.Spec.Replicas != nil && *d.Spec.Replicas >= 2 {
+					log.Printf("DEBUG: Reconciliation: Deployment %s/%s meets criteria, checking for existing PDB", d.Namespace, d.Name)
 					// Check if PDB already exists before creating
 					if !workloadHasExistingPDB(ctx, clientset, &d) {
+						log.Printf("DEBUG: Reconciliation: No existing PDB for %s/%s, creating PDB", d.Namespace, d.Name)
 						createPDBForWorkload(ctx, clientset, &d)
+					} else {
+						log.Printf("DEBUG: Reconciliation: Existing PDB found for %s/%s, skipping creation", d.Namespace, d.Name)
 					}
+				} else {
+					log.Printf("DEBUG: Reconciliation: Deployment %s/%s does not meet criteria, skipping", d.Namespace, d.Name)
 				}
 			}
 		}
@@ -1195,18 +1202,23 @@ func workloadHasExistingPDB(ctx context.Context, clientset *kubernetes.Clientset
 	var namespace, name string
 	var labels map[string]string
 
+	log.Printf("DEBUG: workloadHasExistingPDB called for object type %T", obj)
+
 	switch workload := obj.(type) {
 	case *appsv1.Deployment:
 		selector = workload.Spec.Selector
 		namespace = workload.Namespace
 		name = workload.Name
 		labels = workload.Labels
+		log.Printf("DEBUG: Processing Deployment %s/%s with labels %v", namespace, name, labels)
 	case *appsv1.StatefulSet:
 		selector = workload.Spec.Selector
 		namespace = workload.Namespace
 		name = workload.Name
 		labels = workload.Labels
+		log.Printf("DEBUG: Processing StatefulSet %s/%s with labels %v", namespace, name, labels)
 	default:
+		log.Printf("DEBUG: Unknown workload type %T, returning false", obj)
 		return false
 	}
 
