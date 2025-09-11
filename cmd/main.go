@@ -79,12 +79,14 @@ func isWorkloadExcluded(namespace, name string, labels map[string]string) bool {
 	exclusions := defaultPDBConfig.Exclusions
 	defaultPDBConfigLock.RUnlock()
 
+	log.Printf("DEBUG: isWorkloadExcluded called for %s/%s with %d exclusion rules", namespace, name, len(exclusions))
+
 	for _, rule := range exclusions {
 		// Check namespace regex
 		if rule.NamespaceRegex != "" {
 			matched, err := regexp.MatchString(rule.NamespaceRegex, namespace)
 			if err != nil {
-				log.Printf("Warning: Invalid namespace regex '%s' in exclusion rule: %v", rule.NamespaceRegex, err)
+				log.Printf("ERROR: Invalid namespace regex '%s' in exclusion rule (workload: %s/%s): %v", rule.NamespaceRegex, namespace, name, err)
 				continue
 			}
 			if !matched {
@@ -96,7 +98,7 @@ func isWorkloadExcluded(namespace, name string, labels map[string]string) bool {
 		if rule.NameRegex != "" {
 			matched, err := regexp.MatchString(rule.NameRegex, name)
 			if err != nil {
-				log.Printf("Warning: Invalid name regex '%s' in exclusion rule: %v", rule.NameRegex, err)
+				log.Printf("ERROR: Invalid name regex '%s' in exclusion rule (workload: %s/%s): %v", rule.NameRegex, namespace, name, err)
 				continue
 			}
 			if !matched {
@@ -111,7 +113,7 @@ func isWorkloadExcluded(namespace, name string, labels map[string]string) bool {
 				if labelValue, exists := labels[key]; exists {
 					matched, err := regexp.MatchString(valuePattern, labelValue)
 					if err != nil {
-						log.Printf("Warning: Invalid label value regex '%s' for key '%s' in exclusion rule: %v", valuePattern, key, err)
+						log.Printf("ERROR: Invalid label value regex '%s' for key '%s' in exclusion rule (workload: %s/%s): %v", valuePattern, key, namespace, name, err)
 						allLabelsMatch = false
 						break
 					}
@@ -471,9 +473,46 @@ func updateDefaultPDBConfig(cm *corev1.ConfigMap, clientset *kubernetes.Clientse
 			exclusions = []ExclusionRule{}
 		} else {
 			log.Printf("DEBUG: Successfully parsed %d exclusion rules", len(exclusions))
+			// Validate regex patterns when loading
+			validRules := []ExclusionRule{}
 			for i, rule := range exclusions {
 				log.Printf("DEBUG: Rule %d: namespaceRegex='%s', nameRegex='%s', labels=%v", i, rule.NamespaceRegex, rule.NameRegex, rule.Labels)
+
+				// Validate namespace regex
+				if rule.NamespaceRegex != "" {
+					if _, err := regexp.Compile(rule.NamespaceRegex); err != nil {
+						log.Printf("ERROR: Invalid namespace regex '%s' in exclusion rule %d: %v", rule.NamespaceRegex, i, err)
+						continue
+					}
+				}
+
+				// Validate name regex
+				if rule.NameRegex != "" {
+					if _, err := regexp.Compile(rule.NameRegex); err != nil {
+						log.Printf("ERROR: Invalid name regex '%s' in exclusion rule %d: %v", rule.NameRegex, i, err)
+						continue
+					}
+				}
+
+				// Validate label value regex patterns
+				validRule := true
+				for key, valuePattern := range rule.Labels {
+					if _, err := regexp.Compile(valuePattern); err != nil {
+						log.Printf("ERROR: Invalid label value regex '%s' for key '%s' in exclusion rule %d: %v", valuePattern, key, i, err)
+						validRule = false
+						break
+					}
+				}
+
+				if validRule {
+					validRules = append(validRules, rule)
+					log.Printf("DEBUG: Rule %d is valid and will be used", i)
+				} else {
+					log.Printf("ERROR: Rule %d has invalid regex patterns and will be skipped", i)
+				}
 			}
+			exclusions = validRules
+			log.Printf("DEBUG: %d valid exclusion rules loaded (skipped %d invalid rules)", len(exclusions), len(exclusions)-len(validRules))
 		}
 	} else {
 		log.Printf("DEBUG: No exclusions found in ConfigMap")
@@ -844,6 +883,7 @@ func logAndFixPoorPDBConfig(
 
 // core create PDB workflow
 func createPDBForWorkload(ctx context.Context, clientset *kubernetes.Clientset, obj interface{}) {
+	log.Printf("DEBUG: createPDBForWorkload called for object type %T", obj)
 	var (
 		selector            *metav1.LabelSelector
 		namespace, name     string
@@ -868,9 +908,12 @@ func createPDBForWorkload(ctx context.Context, clientset *kubernetes.Clientset, 
 		name = workload.Name
 
 		// Check if workload should be excluded
+		log.Printf("DEBUG: About to check exclusions for %s/%s", namespace, name)
 		if isWorkloadExcluded(namespace, name, workload.Labels) {
+			log.Printf("EXCLUDED: Workload %s/%s is excluded", namespace, name)
 			return
 		}
+		log.Printf("DEBUG: Workload %s/%s is NOT excluded", namespace, name)
 	case *appsv1.StatefulSet:
 		replicas = workload.Spec.Replicas
 		if replicas == nil || *replicas < 2 {
@@ -887,9 +930,12 @@ func createPDBForWorkload(ctx context.Context, clientset *kubernetes.Clientset, 
 		name = workload.Name
 
 		// Check if workload should be excluded
+		log.Printf("DEBUG: About to check exclusions for %s/%s", namespace, name)
 		if isWorkloadExcluded(namespace, name, workload.Labels) {
+			log.Printf("EXCLUDED: Workload %s/%s is excluded", namespace, name)
 			return
 		}
+		log.Printf("DEBUG: Workload %s/%s is NOT excluded", namespace, name)
 	default:
 		return
 	}
@@ -1207,10 +1253,12 @@ func workloadHasExistingPDB(ctx context.Context, clientset *kubernetes.Clientset
 	}
 
 	// Check if workload should be excluded
+	log.Printf("DEBUG: Reconciliation: Checking exclusions for %s/%s", namespace, name)
 	if isWorkloadExcluded(namespace, name, labels) {
 		log.Printf("Reconciliation: Workload %s/%s is excluded, skipping PDB creation", namespace, name)
 		return true
 	}
+	log.Printf("DEBUG: Reconciliation: Workload %s/%s is NOT excluded", namespace, name)
 
 	if selector == nil {
 		return false

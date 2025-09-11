@@ -55,14 +55,9 @@ config:
   # Regular expression patterns are used for flexible matching
   # Empty strings for namespaceRegex or nameRegex, or empty object {} for labels, mean "no filter" for that criterion
   exclusions:
-    - namespaceRegex: "^kube-system$"
-      nameRegex: ""
+    - nameRegex: .*-temp$
+      namespaceRegex: ""
       labels: {}
-    - namespaceRegex: ""
-      nameRegex: ".*-temp$"
-      labels:
-        app: "^db-.*"
-        env: "staging|dev"
 
 # Resource configuration
 resources:
