@@ -27,6 +27,9 @@ This controller enables safe, automated disruption management with per-workload 
 - **Bypass Support:**  
   Workloads can opt out of automatic PDB management at any time by adding a bypass annotation.
 
+- **Exclusion Rules:**  
+  Configure regex-based exclusion rules to automatically skip PDB creation for specific workloads based on namespace, name, and label patterns. Useful for system workloads, temporary deployments, or critical services.
+
 - **Garbage Collection:**  
   Orphaned PDBs are cleaned up when workloads are deleted or change state.
 
@@ -51,11 +54,56 @@ data:
   minAvailable: "1"
   # maxUnavailable: "50%"  # Optional, use one or the other
   FixPoorPDBs: "true"  # Set to "true" to auto-fix poor PDBs, "false" to only warn
+  exclusions: |
+    - namespaceRegex: "^kube-system$"
+      nameRegex: ""
+      labels: {}
+    - namespaceRegex: ""
+      nameRegex: ".*-temp$"
+      labels:
+        app: "^db-.*"
+        env: "staging|dev"
 ```
 
 ---
 
-### 2. **Per-Workload Annotations**
+### 2. **Exclusion Rules**
+
+Configure exclusion rules to automatically skip PDB creation for specific workloads:
+
+```yaml
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: castai-pdb-controller-config
+  namespace: castai-agent
+data:
+  exclusions: |
+    - namespaceRegex: "^kube-system$"  # Exclude all workloads in kube-system
+      nameRegex: ""
+      labels: {}
+    - namespaceRegex: ""               # Exclude workloads with names ending in -temp
+      nameRegex: ".*-temp$"
+      labels:
+        app: "^db-.*"                  # AND app label starts with db-
+        env: "staging|dev"             # AND env is staging or dev
+    - namespaceRegex: "monitoring"     # Exclude workloads in monitoring namespace
+      nameRegex: ""
+      labels:
+        role: "critical"               # AND role label is critical
+```
+
+**Exclusion Rule Logic:**
+- Each rule is evaluated independently
+- If a workload matches ANY rule, no PDB is created
+- Within a single rule, all specified criteria must match (AND logic)
+- Empty strings for `namespaceRegex` or `nameRegex` mean "no filter"
+- Empty object `{}` for `labels` means "no label filter"
+- Regular expressions are supported for flexible matching
+
+---
+
+### 3. **Per-Workload Annotations**
 
 Add annotations to your Deployment or StatefulSet to override the defaults:
 
