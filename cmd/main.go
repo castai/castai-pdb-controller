@@ -79,7 +79,16 @@ func isWorkloadExcluded(namespace, name string, labels map[string]string) bool {
 	exclusions := defaultPDBConfig.Exclusions
 	defaultPDBConfigLock.RUnlock()
 
-	for _, rule := range exclusions {
+	log.Printf("DEBUG: Checking exclusions for workload %s/%s with labels %v", namespace, name, labels)
+	log.Printf("DEBUG: Found %d exclusion rules", len(exclusions))
+
+	if len(exclusions) == 0 {
+		log.Printf("DEBUG: No exclusion rules loaded - this means config loading failed!")
+		return false
+	}
+
+	for i, rule := range exclusions {
+		log.Printf("DEBUG: Checking rule %d: namespaceRegex='%s', nameRegex='%s', labels=%v", i, rule.NamespaceRegex, rule.NameRegex, rule.Labels)
 		// Check namespace regex
 		if rule.NamespaceRegex != "" {
 			matched, err := regexp.MatchString(rule.NamespaceRegex, namespace)
@@ -87,6 +96,7 @@ func isWorkloadExcluded(namespace, name string, labels map[string]string) bool {
 				log.Printf("Warning: Invalid namespace regex '%s' in exclusion rule: %v", rule.NamespaceRegex, err)
 				continue
 			}
+			log.Printf("DEBUG: Namespace regex '%s' matched '%s': %v", rule.NamespaceRegex, namespace, matched)
 			if !matched {
 				continue
 			}
@@ -99,6 +109,7 @@ func isWorkloadExcluded(namespace, name string, labels map[string]string) bool {
 				log.Printf("Warning: Invalid name regex '%s' in exclusion rule: %v", rule.NameRegex, err)
 				continue
 			}
+			log.Printf("DEBUG: Name regex '%s' matched '%s': %v", rule.NameRegex, name, matched)
 			if !matched {
 				continue
 			}
@@ -130,6 +141,7 @@ func isWorkloadExcluded(namespace, name string, labels map[string]string) bool {
 		}
 
 		// If we get here, all criteria matched
+		log.Printf("DEBUG: Workload %s/%s EXCLUDED by rule %d", namespace, name, i)
 		return true
 	}
 
@@ -282,14 +294,14 @@ func main() {
 		panic(err)
 	}
 
-	// Silence logs in all pods until leadership is acquired
-	log.SetOutput(io.Discard)
-
 	// Initialize default config first to prevent panics
 	resetDefaultPDBConfig()
 
 	// Load config and ensure it's properly initialized before starting leader election
 	loadDefaultPDBConfig(ctx, clientset)
+
+	// Silence logs in all pods until leadership is acquired
+	log.SetOutput(io.Discard)
 
 	// Double-check that config is properly initialized
 	defaultPDBConfigLock.RLock()
@@ -462,11 +474,19 @@ func updateDefaultPDBConfig(cm *corev1.ConfigMap, clientset *kubernetes.Clientse
 	// Parse exclusion rules from ConfigMap
 	var exclusions []ExclusionRule
 	if exclusionYAML, ok := cm.Data["exclusions"]; ok && exclusionYAML != "" {
+		log.Printf("DEBUG: Found exclusions in ConfigMap: %s", exclusionYAML)
 		err := yaml.Unmarshal([]byte(exclusionYAML), &exclusions)
 		if err != nil {
 			log.Printf("Warning: failed to parse exclusions from ConfigMap: %v\n", err)
 			exclusions = []ExclusionRule{}
+		} else {
+			log.Printf("DEBUG: Successfully parsed %d exclusion rules", len(exclusions))
+			for i, rule := range exclusions {
+				log.Printf("DEBUG: Rule %d: namespaceRegex='%s', nameRegex='%s', labels=%v", i, rule.NamespaceRegex, rule.NameRegex, rule.Labels)
+			}
 		}
+	} else {
+		log.Printf("DEBUG: No exclusions found in ConfigMap")
 	}
 
 	defaultPDBConfigLock.Lock()
@@ -484,6 +504,11 @@ func updateDefaultPDBConfig(cm *corev1.ConfigMap, clientset *kubernetes.Clientse
 		"logInterval=%v, pdbScanInterval=%v, garbageCollectInterval=%v, pdbDumpInterval=%v, exclusions=%d rules\n",
 		minAvailable, maxUnavailable, fixPoorPDBs, logInterval, pdbScanInterval,
 		garbageCollectInterval, pdbDumpInterval, len(exclusions))
+
+	log.Printf("DEBUG: Final exclusion rules loaded: %d rules", len(exclusions))
+	for i, rule := range exclusions {
+		log.Printf("DEBUG: Final rule %d: namespaceRegex='%s', nameRegex='%s', labels=%v", i, rule.NamespaceRegex, rule.NameRegex, rule.Labels)
+	}
 
 	// Reconcile all PDBs that use defaults
 	go reconcileAllDefaultPDBs(context.Background(), clientset)
@@ -506,12 +531,14 @@ func resetDefaultPDBConfig() {
 
 // loads the configmap values
 func loadDefaultPDBConfig(ctx context.Context, clientset *kubernetes.Clientset) {
+	log.Printf("DEBUG: Loading config from ConfigMap %s/%s", configMapNamespace, configMapName)
 	cm, err := clientset.CoreV1().ConfigMaps(configMapNamespace).Get(ctx, configMapName, metav1.GetOptions{})
 	if err != nil {
 		log.Printf("Warning: could not load default PDB config, using built-in defaults: %v\n", err)
 		resetDefaultPDBConfig()
 		return
 	}
+	log.Printf("DEBUG: Successfully loaded ConfigMap, updating config")
 	updateDefaultPDBConfig(cm, clientset)
 }
 
@@ -827,6 +854,7 @@ func logAndFixPoorPDBConfig(
 
 // core create PDB workflow
 func createPDBForWorkload(ctx context.Context, clientset *kubernetes.Clientset, obj interface{}) {
+	log.Printf("DEBUG: createPDBForWorkload called")
 	var (
 		selector            *metav1.LabelSelector
 		namespace, name     string
@@ -1117,6 +1145,7 @@ func garbageCollectOrphanedPDBs(ctx context.Context, clientset *kubernetes.Clien
 
 // Reconcile all workloads that use default PDB config
 func reconcileAllDefaultPDBs(ctx context.Context, clientset *kubernetes.Clientset) {
+	log.Printf("DEBUG: reconcileAllDefaultPDBs called")
 	namespaces, err := clientset.CoreV1().Namespaces().List(ctx, metav1.ListOptions{})
 	if err != nil {
 		log.Printf("Failed to list namespaces: %v", err)
@@ -1164,19 +1193,30 @@ func reconcileAllDefaultPDBs(ctx context.Context, clientset *kubernetes.Clientse
 func workloadHasExistingPDB(ctx context.Context, clientset *kubernetes.Clientset, obj interface{}) bool {
 	var selector *metav1.LabelSelector
 	var namespace, name string
+	var labels map[string]string
 
 	switch workload := obj.(type) {
 	case *appsv1.Deployment:
 		selector = workload.Spec.Selector
 		namespace = workload.Namespace
 		name = workload.Name
+		labels = workload.Labels
 	case *appsv1.StatefulSet:
 		selector = workload.Spec.Selector
 		namespace = workload.Namespace
 		name = workload.Name
+		labels = workload.Labels
 	default:
 		return false
 	}
+
+	// Check if workload should be excluded
+	log.Printf("DEBUG: About to call isWorkloadExcluded for %s/%s with labels %v", namespace, name, labels)
+	if isWorkloadExcluded(namespace, name, labels) {
+		log.Printf("Reconciliation: Workload %s/%s is excluded, skipping PDB creation", namespace, name)
+		return true
+	}
+	log.Printf("DEBUG: Workload %s/%s is NOT excluded, continuing with PDB check", namespace, name)
 
 	if selector == nil {
 		return false
