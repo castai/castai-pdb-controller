@@ -56,7 +56,7 @@ helm install castai-pdb-controller castai/castai-pdb-controller \
 |-----------|-------------|---------|
 | `replicaCount` | Number of controller replicas | `2` |
 | `image.repository` | Container image repository | `castai/castai-pdb-controller` |
-| `image.tag` | Container image tag | `"latest"` |
+| `image.tag` | Container image tag | `"0.3"` |
 | `image.pullPolicy` | Container image pull policy | `IfNotPresent` |
 | `nameOverride` | Override the chart name | `""` |
 | `fullnameOverride` | Override the full app name | `""` |
@@ -71,6 +71,7 @@ helm install castai-pdb-controller castai/castai-pdb-controller \
 | `config.pdbScanInterval` | PDB scan interval | `"2m"` |
 | `config.garbageCollectInterval` | Garbage collection interval | `"2m"` |
 | `config.pdbDumpInterval` | PDB dump interval | `"5m"` |
+| `config.logLevel` | Log verbosity: `debug`, `info`, `warn`, `error` | `"info"` |
 | `config.exclusions` | YAML list of exclusion rules for workloads | `[]` (empty) |
 | `resources.limits.cpu` | CPU limit | `500m` |
 | `resources.limits.memory` | Memory limit | `512Mi` |
@@ -218,6 +219,7 @@ kubectl get clusterrolebinding castai-pdb-controller
 # Upgrade to a new version
 helm upgrade castai-pdb-controller castai/castai-pdb-controller \
   -n castai-agent
+```
 
 ## Uninstalling
 
