@@ -71,6 +71,7 @@ helm install castai-pdb-controller castai/castai-pdb-controller \
 | `config.pdbScanInterval` | PDB scan interval | `"2m"` |
 | `config.garbageCollectInterval` | Garbage collection interval | `"2m"` |
 | `config.pdbDumpInterval` | PDB dump interval | `"5m"` |
+| `config.logLevel` | Application log level: `debug`, `info`, `warn`, `error` | `"info"` |
 | `config.exclusions` | YAML list of exclusion rules for workloads | `[]` (empty) |
 | `resources.limits.cpu` | CPU limit | `500m` |
 | `resources.limits.memory` | Memory limit | `512Mi` |

@@ -20,6 +20,7 @@ data:
   pdbScanInterval: {{ .Values.config.pdbScanInterval | quote }}
   garbageCollectInterval: {{ .Values.config.garbageCollectInterval | quote }}
   pdbDumpInterval: {{ .Values.config.pdbDumpInterval | quote }}
+  logLevel: {{ .Values.config.logLevel | quote }}
   {{- if .Values.config.exclusions }}
   exclusions: |
 {{ toYaml .Values.config.exclusions | indent 4 }}

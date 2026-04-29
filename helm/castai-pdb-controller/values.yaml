@@ -7,7 +7,7 @@ image:
   # Container image repository
   repository: castai/castai-pdb-controller
   # Container image tag
-  tag: "0.2"
+  tag: "0.3"
   # Container image pull policy
   pullPolicy: IfNotPresent
 
@@ -49,6 +49,8 @@ config:
   garbageCollectInterval: "2m"
   # PDB dump interval (e.g., "5m", "10m")
   pdbDumpInterval: "5m"
+  # Application log level: debug, info, warn (or warning), error
+  logLevel: "info"
   # Exclusion rules for workloads to skip PDB creation
   # Each rule is evaluated independently; if a workload matches ANY rule, no PDB is created
   # Within a single rule, all specified criteria (namespaceRegex, nameRegex, labels) must match (AND logic)

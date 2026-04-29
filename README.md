@@ -36,6 +36,9 @@ This controller enables safe, automated disruption management with per-workload 
 - **Leader Election:**  
   Supports safe, highly available operation in multi-replica controller deployments.
 
+- **Configurable log levels:**  
+  Set `logLevel` in the `castai-pdb-controller-config` ConfigMap to `debug`, `info`, `warn`, or `error` (default `info`) to control how much the controller writes to stderr.
+
 ---
 
 ## Usage
@@ -52,6 +55,7 @@ metadata:
   namespace: castai-agent
 data:
   minAvailable: "1"
+  logLevel: "info"  # debug | info | warn | error — default info suppresses DEBUG trace lines
   # maxUnavailable: "50%"  # Optional, use one or the other
   FixPoorPDBs: "true"  # Set to "true" to auto-fix poor PDBs, "false" to only warn
   exclusions: |
@@ -174,6 +178,23 @@ spec:
   The controller deletes the associated PDB.
 - **On ConfigMap update:**  
   All workloads using the default config are updated to the new values.
+
+---
+
+## Log levels
+
+Verbosity is controlled by the `logLevel` key in the `castai-pdb-controller-config` ConfigMap (no redeploy required). You can also set the `CASTAI_PDB_CONTROLLER_LOG_LEVEL` environment variable on the controller pod **only when** `logLevel` is omitted from the ConfigMap.
+
+| Level | Meaning |
+|-------|---------|
+| **error** | Failures only (API errors, invalid exclusion regexes, failed creates/deletes). |
+| **warn** | Errors plus warnings (invalid durations in the ConfigMap, invalid selectors, poor-PDB / multi-PDB warnings). Hides routine success lines. |
+| **info** | **Default.** Normal operations (PDB create/update/delete, skips, leader messages, config summary). Does not emit `DEBUG:` trace lines. |
+| **debug** | Everything including high-volume `DEBUG:` traces (per-workload exclusion checks, reconciliation steps). Use only while troubleshooting. |
+
+Aliases (case-insensitive): `d`, `i`, `w`, `e`, `warning`, `fatal` (same as `error`). Unknown values fall back to `info` with a warning.
+
+**Helm:** set `config.logLevel` in `values.yaml` (rendered into the ConfigMap).
 
 ---
 
