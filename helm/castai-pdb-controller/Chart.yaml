@@ -3,6 +3,6 @@ name: castai-pdb-controller
 description: A Helm chart for CAST AI PDB Controller
 type: application
 version: 0.2.0
-appVersion: "0.2"
+appVersion: "0.3"
 maintainers:
   - name: CAST AI 
