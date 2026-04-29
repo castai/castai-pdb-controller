@@ -1,0 +1,26 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: castai-pdb-controller
+  namespace: castai-agent
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: castai-pdb-controller
+  template:
+    metadata:
+      labels:
+        app: castai-pdb-controller
+    spec:
+      serviceAccountName: castai-pdb-controller
+      containers:
+      - name: castai-pdb-controller
+        image: castai/castai-pdb-controller:latest
+
+
+
+
+
+
+

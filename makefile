@@ -2,7 +2,7 @@
 
 # Variables
 DOCKER_IMAGE_NAME = castai/castai-pdb-controller
-DOCKER_IMAGE_TAGS = latest 0.3
+DOCKER_IMAGE_TAGS = latest 0.2
 PLATFORMS = linux/amd64,linux/arm64
 
 # Enable BuildKit
