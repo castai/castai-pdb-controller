@@ -1,4 +1,4 @@
-# Values for reproducing GitHub #10 on minikube: excluded istio-system + 2 replicas.
+# Values for reproducing GitHub #10 on minikube (production-style namespace exclusions).
 replicaCount: 2
 image:
   repository: castai/castai-pdb-controller
@@ -7,6 +7,6 @@ image:
 config:
   logLevel: debug
   exclusions:
-    - namespaceRegex: "^(castai-agent|istio-system)$"
+    - namespaceRegex: "^(castai-agent|istio-system|wiz|einstein|pcf|thirdparty|marketing|passthrough|compendium|endowment|observability|protectioncapability|dwm)$"
       nameRegex: ""
       labels: {}
