@@ -420,12 +420,12 @@ func watchConfigMap(ctx context.Context, clientset *kubernetes.Clientset) {
 	cmInformer.AddEventHandler(cache.ResourceEventHandlerFuncs{
 		AddFunc: func(obj interface{}) {
 			if cm, ok := obj.(*corev1.ConfigMap); ok && cm.Name == configMapName {
-				updateDefaultPDBConfig(cm, clientset, true)
+				updateDefaultPDBConfig(ctx, cm, clientset, true)
 			}
 		},
 		UpdateFunc: func(oldObj, newObj interface{}) {
 			if cm, ok := newObj.(*corev1.ConfigMap); ok && cm.Name == configMapName {
-				updateDefaultPDBConfig(cm, clientset, true)
+				updateDefaultPDBConfig(ctx, cm, clientset, true)
 			}
 		},
 		DeleteFunc: func(obj interface{}) {
@@ -442,7 +442,8 @@ func watchConfigMap(ctx context.Context, clientset *kubernetes.Clientset) {
 
 // makes necessary updates to default behavior.
 // If reconcile is true, kicks off full reconcile and poor-PDB scan (leader only; see runController).
-func updateDefaultPDBConfig(cm *corev1.ConfigMap, clientset *kubernetes.Clientset, reconcile bool) {
+// ctx is passed to background reconcile/scans so they stop when the controller shuts down.
+func updateDefaultPDBConfig(ctx context.Context, cm *corev1.ConfigMap, clientset *kubernetes.Clientset, reconcile bool) {
 	syncLogLevelFromData(cm.Data)
 
 	var minAvailable, maxUnavailable *intstr.IntOrString
@@ -547,8 +548,8 @@ func updateDefaultPDBConfig(cm *corev1.ConfigMap, clientset *kubernetes.Clientse
 
 	if reconcile {
 		// Reconcile all PDBs that use defaults (must not run on non-leader replicas)
-		go reconcileAllDefaultPDBs(context.Background(), clientset)
-		go scanAllPDBsForPoorConfig(context.Background(), clientset)
+		go reconcileAllDefaultPDBs(ctx, clientset)
+		go scanAllPDBsForPoorConfig(ctx, clientset)
 	}
 }
 
@@ -578,7 +579,7 @@ func loadDefaultPDBConfig(ctx context.Context, clientset *kubernetes.Clientset) 
 		return
 	}
 	logDebugf("Successfully loaded ConfigMap, updating config")
-	updateDefaultPDBConfig(cm, clientset, false)
+	updateDefaultPDBConfig(ctx, cm, clientset, false)
 }
 
 // Runs the main controller loop to automatically create, update, and delete PodDisruptionBudgets for Deployments and StatefulSets in response to workload events and annotations.
@@ -1023,8 +1024,11 @@ func createPDBForWorkload(ctx context.Context, clientset *kubernetes.Clientset, 
 		}
 		pdbListAfter, err := clientset.PolicyV1().PodDisruptionBudgets(namespace).List(ctx, metav1.ListOptions{})
 		if err != nil {
-			logErrorf("Failed to list PDBs in namespace %s (race check): %v\n", namespace, err)
-			return
+			// Transient API errors: retry; if all attempts fail, fall through to Get/Create
+			// (Create returns AlreadyExists if another writer won the race).
+			logWarnf("Race check: list PDBs in namespace %s failed (attempt %d/%d), will retry or proceed: %v\n",
+				namespace, attempt+1, pdbRaceRecheckAttempts, err)
+			continue
 		}
 		for _, pdb := range pdbListAfter.Items {
 			if pdb.Spec.Selector != nil {
