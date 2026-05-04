@@ -1,0 +1,12 @@
+# Values for reproducing GitHub #10 on minikube: excluded istio-system + 2 replicas.
+replicaCount: 2
+image:
+  repository: castai/castai-pdb-controller
+  tag: minikube-test
+  pullPolicy: Never
+config:
+  logLevel: debug
+  exclusions:
+    - namespaceRegex: "^(castai-agent|istio-system)$"
+      nameRegex: ""
+      labels: {}

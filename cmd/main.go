@@ -42,6 +42,9 @@ const (
 	defaultGarbageCollectInterval = 2 * time.Minute
 	defaultPDBDumpInterval        = 5 * time.Minute
 	pdbDumpFile                   = "/tmp/castai-pdbs.yaml"
+	// When no PDB exists yet, re-list a few times to catch concurrent writers without a long fixed sleep (GitHub #10).
+	pdbRaceRecheckAttempts = 8
+	pdbRaceRecheckInterval = 250 * time.Millisecond
 )
 
 type ExclusionRule struct {
@@ -311,11 +314,6 @@ func main() {
 		resetDefaultPDBConfig()
 	}
 
-	go watchConfigMap(ctx, clientset)
-
-	// Scan all existing PDBs for poor configuration at startup
-	go scanAllPDBsForPoorConfig(ctx, clientset)
-
 	lock := &resourcelock.LeaseLock{
 		LeaseMeta: metav1.ObjectMeta{
 			Name:      "castai-pdb-controller-leader-election",
@@ -422,12 +420,12 @@ func watchConfigMap(ctx context.Context, clientset *kubernetes.Clientset) {
 	cmInformer.AddEventHandler(cache.ResourceEventHandlerFuncs{
 		AddFunc: func(obj interface{}) {
 			if cm, ok := obj.(*corev1.ConfigMap); ok && cm.Name == configMapName {
-				updateDefaultPDBConfig(cm, clientset)
+				updateDefaultPDBConfig(cm, clientset, true)
 			}
 		},
 		UpdateFunc: func(oldObj, newObj interface{}) {
 			if cm, ok := newObj.(*corev1.ConfigMap); ok && cm.Name == configMapName {
-				updateDefaultPDBConfig(cm, clientset)
+				updateDefaultPDBConfig(cm, clientset, true)
 			}
 		},
 		DeleteFunc: func(obj interface{}) {
@@ -442,8 +440,9 @@ func watchConfigMap(ctx context.Context, clientset *kubernetes.Clientset) {
 	<-ctx.Done()
 }
 
-// makes necessary updates to default behavior
-func updateDefaultPDBConfig(cm *corev1.ConfigMap, clientset *kubernetes.Clientset) {
+// makes necessary updates to default behavior.
+// If reconcile is true, kicks off full reconcile and poor-PDB scan (leader only; see runController).
+func updateDefaultPDBConfig(cm *corev1.ConfigMap, clientset *kubernetes.Clientset, reconcile bool) {
 	syncLogLevelFromData(cm.Data)
 
 	var minAvailable, maxUnavailable *intstr.IntOrString
@@ -546,9 +545,11 @@ func updateDefaultPDBConfig(cm *corev1.ConfigMap, clientset *kubernetes.Clientse
 		logDebugf("Final rule %d: namespaceRegex='%s', nameRegex='%s', labels=%v", i, rule.NamespaceRegex, rule.NameRegex, rule.Labels)
 	}
 
-	// Reconcile all PDBs that use defaults
-	go reconcileAllDefaultPDBs(context.Background(), clientset)
-	go scanAllPDBsForPoorConfig(context.Background(), clientset)
+	if reconcile {
+		// Reconcile all PDBs that use defaults (must not run on non-leader replicas)
+		go reconcileAllDefaultPDBs(context.Background(), clientset)
+		go scanAllPDBsForPoorConfig(context.Background(), clientset)
+	}
 }
 
 // resets default behavior
@@ -561,6 +562,7 @@ func resetDefaultPDBConfig() {
 	defaultPDBConfig.PDBScanInterval = defaultPDBScanInterval
 	defaultPDBConfig.GarbageCollectInterval = defaultGarbageCollectInterval
 	defaultPDBConfig.PDBDumpInterval = defaultPDBDumpInterval
+	defaultPDBConfig.Exclusions = nil
 	defaultPDBConfigLock.Unlock()
 	syncLogLevelFromData(nil)
 	logInfof("Default PDB config reset: using built-in fallback\n")
@@ -576,11 +578,15 @@ func loadDefaultPDBConfig(ctx context.Context, clientset *kubernetes.Clientset) 
 		return
 	}
 	logDebugf("Successfully loaded ConfigMap, updating config")
-	updateDefaultPDBConfig(cm, clientset)
+	updateDefaultPDBConfig(cm, clientset, false)
 }
 
 // Runs the main controller loop to automatically create, update, and delete PodDisruptionBudgets for Deployments and StatefulSets in response to workload events and annotations.
 func runController(ctx context.Context, clientset *kubernetes.Clientset) {
+	// ConfigMap watch and initial poor-PDB scan must run only on the leader (GitHub #10).
+	go watchConfigMap(ctx, clientset)
+	go scanAllPDBsForPoorConfig(ctx, clientset)
+
 	factory := informers.NewSharedInformerFactory(clientset, 10*time.Minute)
 
 	deployInformer := factory.Apps().V1().Deployments().Informer()
@@ -1005,17 +1011,25 @@ func createPDBForWorkload(ctx context.Context, clientset *kubernetes.Clientset, 
 		return
 	}
 
-	// No existing PDB found, add delay and double-check to handle race conditions
-	time.Sleep(10 * time.Second)
-
-	// Final check for any PDB that might have been created during the delay
-	pdbListAfter, err := clientset.PolicyV1().PodDisruptionBudgets(namespace).List(ctx, metav1.ListOptions{})
-	if err == nil {
+	// No existing PDB yet: bounded re-list with short gaps (replaces a single long sleep) to catch
+	// concurrent writers while respecting ctx and avoiding leader-election timing hazards (GitHub #10).
+	for attempt := 0; attempt < pdbRaceRecheckAttempts; attempt++ {
+		if attempt > 0 {
+			select {
+			case <-ctx.Done():
+				return
+			case <-time.After(pdbRaceRecheckInterval):
+			}
+		}
+		pdbListAfter, err := clientset.PolicyV1().PodDisruptionBudgets(namespace).List(ctx, metav1.ListOptions{})
+		if err != nil {
+			logErrorf("Failed to list PDBs in namespace %s (race check): %v\n", namespace, err)
+			return
+		}
 		for _, pdb := range pdbListAfter.Items {
 			if pdb.Spec.Selector != nil {
 				pdbSel, err := metav1.LabelSelectorAsSelector(pdb.Spec.Selector)
 				if err == nil && workloadSel.String() == pdbSel.String() {
-					// Found a PDB that was created after our initial check, skip creation
 					logInfof("Skipping PDB creation for %s/%s: PDB %s was created after initial check", namespace, name, pdb.Name)
 					return
 				}
