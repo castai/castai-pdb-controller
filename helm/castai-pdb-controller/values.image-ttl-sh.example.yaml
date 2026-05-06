@@ -1,0 +1,13 @@
+# Ephemeral ttl.sh image overrides for local/integration testing before publishing.
+# Image ref: ttl.sh/feb97ed9-f8e1-4ef7-b346-a3d328423582:24h
+#
+# Install (example namespace castai-agent, must exist or use --create-namespace):
+#   helm upgrade --install castai-pdb ./helm/castai-pdb-controller \
+#     --namespace castai-agent --create-namespace \
+#     -f helm/castai-pdb-controller/values.image-ttl-sh.example.yaml \
+#     --wait --timeout 5m
+
+image:
+  repository: ttl.sh/feb97ed9-f8e1-4ef7-b346-a3d328423582
+  tag: "24h"
+  pullPolicy: Always
