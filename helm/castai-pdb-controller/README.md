@@ -55,7 +55,7 @@ helm install castai-pdb-controller castai/castai-pdb-controller \
 | Parameter | Description | Default |
 |-----------|-------------|---------|
 | `replicaCount` | Number of controller replicas | `2` |
-| `image.repository` | Container image repository | `castai/castai-pdb-controller` |
+| `image.repository` | Container image repository | `us-docker.pkg.dev/castai-hub/library/castai-pdb-controller` |
 | `image.tag` | Container image tag | `"0.4"` |
 | `image.pullPolicy` | Container image pull policy | `IfNotPresent` |
 | `nameOverride` | Override the chart name | `""` |
