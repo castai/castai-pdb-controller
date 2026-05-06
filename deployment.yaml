@@ -16,7 +16,7 @@ spec:
       serviceAccountName: castai-pdb-controller
       containers:
       - name: castai-pdb-controller
-        image: castai/castai-pdb-controller:latest
+        image: us-docker.pkg.dev/castai-hub/library/castai-pdb-controller:0.4
 
 
 
