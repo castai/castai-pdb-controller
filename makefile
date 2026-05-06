@@ -1,7 +1,7 @@
 # Makefile for building and pushing a multi-arch Docker image using BuildKit
 
-# Variables
-DOCKER_IMAGE_NAME = castai/castai-pdb-controller
+# Variables — align with Helm default (Artifact Registry castai-hub)
+DOCKER_IMAGE_NAME = us-docker.pkg.dev/castai-hub/library/castai-pdb-controller
 DOCKER_IMAGE_TAGS = latest 0.4
 PLATFORMS = linux/amd64,linux/arm64
 
@@ -24,9 +24,9 @@ build:
 		--push \
 		.
 
-# Push the Docker image to Docker Hub (informational only)
+# Push target is informational (build uses --push to Artifact Registry; authenticate with gcloud/docker first)
 push:
-	@$(foreach tag,$(DOCKER_IMAGE_TAGS),echo "Image pushed to Docker Hub: $(DOCKER_IMAGE_NAME):$(tag)";)
+	@$(foreach tag,$(DOCKER_IMAGE_TAGS),echo "Image: $(DOCKER_IMAGE_NAME):$(tag)";)
 
 # Clean up the buildx builder
 clean:
