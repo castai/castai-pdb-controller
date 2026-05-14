@@ -37,6 +37,37 @@ func TestParsePDBValue(t *testing.T) {
 	if parsePDBValue("not-a-number") != nil {
 		t.Fatal("invalid int should return nil")
 	}
+	got := parsePDBValue("  25%  ")
+	if got == nil || got.Type != intstr.String || got.StrVal != "25%" {
+		t.Fatalf("trim percent: got %#v", got)
+	}
+}
+
+func TestIsWorkloadExcluded_noRulesNeverExcludes(t *testing.T) {
+	resetDefaultPDBConfig()
+	t.Cleanup(resetDefaultPDBConfig)
+	if isWorkloadExcluded("any", "thing", nil) {
+		t.Fatal("with no exclusion rules, nothing should be excluded")
+	}
+}
+
+func TestIsWorkloadExcluded_nameAndNamespaceBothRequired(t *testing.T) {
+	resetDefaultPDBConfig()
+	t.Cleanup(resetDefaultPDBConfig)
+	defaultPDBConfigLock.Lock()
+	defaultPDBConfig.Exclusions = []ExclusionRule{
+		{NamespaceRegex: "^prod$", NameRegex: "^api$", Labels: map[string]string{}},
+	}
+	defaultPDBConfigLock.Unlock()
+	if !isWorkloadExcluded("prod", "api", nil) {
+		t.Fatal("prod/api should match")
+	}
+	if isWorkloadExcluded("prod", "api-v2", nil) {
+		t.Fatal("prod/api-v2 should not match name regex")
+	}
+	if isWorkloadExcluded("staging", "api", nil) {
+		t.Fatal("staging/api should not match namespace regex")
+	}
 }
 
 func TestParseDurationFromConfigMap(t *testing.T) {
@@ -62,6 +93,14 @@ func TestParseDurationFromConfigMap(t *testing.T) {
 	}
 	if d := parseDurationFromConfigMap(data, "empty", def); d != def {
 		t.Fatalf("empty: got %v want %v", d, def)
+	}
+}
+
+func TestHasCustomPDBAnnotations_unhealthyKeyPresentCountsAsCustom(t *testing.T) {
+	t.Parallel()
+	// Key presence drives reconcile eligibility even if value is empty (caller may fix later).
+	if !hasCustomPDBAnnotations(map[string]string{annotationUnhealthyPodEvictionPolicy: ""}) {
+		t.Fatal("empty unhealthy annotation value should still count as custom PDB annotations")
 	}
 }
 
@@ -181,5 +220,17 @@ func TestResolveUnhealthyPodEvictionPolicy_defaultsAndAnnotation(t *testing.T) {
 	annInvalid := map[string]string{annotationUnhealthyPodEvictionPolicy: "bogus"}
 	if p := resolveUnhealthyPodEvictionPolicy(annInvalid); p == nil || *p != policyv1.AlwaysAllow {
 		t.Fatalf("invalid annotation should fall back to default, got %v", p)
+	}
+
+	// Empty annotation value → invalid parse → fall back to default AlwaysAllow
+	annEmpty := map[string]string{annotationUnhealthyPodEvictionPolicy: ""}
+	if p := resolveUnhealthyPodEvictionPolicy(annEmpty); p == nil || *p != policyv1.AlwaysAllow {
+		t.Fatalf("empty annotation should fall back to default, got %v", p)
+	}
+
+	// Whitespace in annotation value is trimmed by parser
+	annSpaced := map[string]string{annotationUnhealthyPodEvictionPolicy: "  IfHealthyBudget  "}
+	if p := resolveUnhealthyPodEvictionPolicy(annSpaced); p == nil || *p != policyv1.IfHealthyBudget {
+		t.Fatalf("trimmed annotation: got %v", p)
 	}
 }
