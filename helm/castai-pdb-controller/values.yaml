@@ -6,7 +6,7 @@ replicaCount: 2
 image:
   # GCP Artifact Registry (castai-hub). Use imagePullSecrets on the pod if required for your cluster.
   repository: us-docker.pkg.dev/castai-hub/library/castai-pdb-controller
-  tag: "0.4"
+  tag: "0.5"
   # Container image pull policy
   pullPolicy: IfNotPresent
 
@@ -50,6 +50,8 @@ config:
   pdbDumpInterval: "5m"
   # Application log level: debug, info, warn (or warning), error
   logLevel: "info"
+  # PodDisruptionBudget unhealthyPodEvictionPolicy (Kubernetes 1.26+). IfHealthyBudget | AlwaysAllow | "" (omit)
+  defaultUnhealthyPodEvictionPolicy: ""
   # Exclusion rules for workloads to skip PDB creation
   # Each rule is evaluated independently; if a workload matches ANY rule, no PDB is created
   # Within a single rule, all specified criteria (namespaceRegex, nameRegex, labels) must match (AND logic)

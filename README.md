@@ -164,6 +164,7 @@ spec:
 |-------------------------------------------------|------------------------------------------------------------------|--------------------|
 | `workloads.cast.ai/pdb-minAvailable`            | Minimum pods that must be available (int or percent, one only)   | `"2"`, `"50%"`     |
 | `workloads.cast.ai/pdb-maxUnavailable`          | Maximum pods that can be unavailable (int or percent, one only)  | `"1"`, `"25%"`     |
+| `workloads.cast.ai/pdb-unhealthyPodEvictionPolicy` | Override PDB `unhealthyPodEvictionPolicy` (Kubernetes 1.26+)   | `AlwaysAllow`, `IfHealthyBudget` |
 | `workloads.cast.ai/bypass-default-pdb`          | Opt out of automatic PDB management                              | `"true"`           |
 
 ---
