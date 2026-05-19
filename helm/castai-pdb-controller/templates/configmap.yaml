@@ -21,6 +21,10 @@ data:
   garbageCollectInterval: {{ .Values.config.garbageCollectInterval | quote }}
   pdbDumpInterval: {{ .Values.config.pdbDumpInterval | quote }}
   logLevel: {{ .Values.config.logLevel | quote }}
+  {{- $uep := toString .Values.config.defaultUnhealthyPodEvictionPolicy }}
+  {{- if and $uep (ne $uep "") (ne $uep "null") (ne $uep "<nil>") }}
+  defaultUnhealthyPodEvictionPolicy: {{ .Values.config.defaultUnhealthyPodEvictionPolicy | quote }}
+  {{- end }}
   {{- if .Values.config.exclusions }}
   exclusions: |
 {{ toYaml .Values.config.exclusions | indent 4 }}

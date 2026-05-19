@@ -32,16 +32,17 @@ import (
 )
 
 const (
-	configMapNamespace            = "castai-agent"
-	configMapName                 = "castai-pdb-controller-config"
-	annotationMinAvailable        = "workloads.cast.ai/pdb-minAvailable"
-	annotationMaxUnavailable      = "workloads.cast.ai/pdb-maxUnavailable"
-	annotationBypass              = "workloads.cast.ai/bypass-default-pdb"
-	defaultLogInterval            = 15 * time.Minute
-	defaultPDBScanInterval        = 2 * time.Minute
-	defaultGarbageCollectInterval = 2 * time.Minute
-	defaultPDBDumpInterval        = 5 * time.Minute
-	pdbDumpFile                   = "/tmp/castai-pdbs.yaml"
+	configMapNamespace                   = "castai-agent"
+	configMapName                        = "castai-pdb-controller-config"
+	annotationMinAvailable               = "workloads.cast.ai/pdb-minAvailable"
+	annotationMaxUnavailable             = "workloads.cast.ai/pdb-maxUnavailable"
+	annotationUnhealthyPodEvictionPolicy = "workloads.cast.ai/pdb-unhealthyPodEvictionPolicy"
+	annotationBypass                     = "workloads.cast.ai/bypass-default-pdb"
+	defaultLogInterval                   = 15 * time.Minute
+	defaultPDBScanInterval               = 2 * time.Minute
+	defaultGarbageCollectInterval        = 2 * time.Minute
+	defaultPDBDumpInterval               = 5 * time.Minute
+	pdbDumpFile                          = "/tmp/castai-pdbs.yaml"
 	// When no PDB exists yet, re-list a few times to catch concurrent writers without a long fixed sleep (GitHub #10).
 	pdbRaceRecheckAttempts = 8
 	pdbRaceRecheckInterval = 250 * time.Millisecond
@@ -54,14 +55,15 @@ type ExclusionRule struct {
 }
 
 type DefaultPDBConfig struct {
-	MinAvailable           *intstr.IntOrString
-	MaxUnavailable         *intstr.IntOrString
-	FixPoorPDBs            bool
-	LogInterval            time.Duration
-	PDBScanInterval        time.Duration
-	GarbageCollectInterval time.Duration
-	PDBDumpInterval        time.Duration
-	Exclusions             []ExclusionRule
+	MinAvailable               *intstr.IntOrString
+	MaxUnavailable             *intstr.IntOrString
+	UnhealthyPodEvictionPolicy *policyv1.UnhealthyPodEvictionPolicyType
+	FixPoorPDBs                bool
+	LogInterval                time.Duration
+	PDBScanInterval            time.Duration
+	GarbageCollectInterval     time.Duration
+	PDBDumpInterval            time.Duration
+	Exclusions                 []ExclusionRule
 }
 
 var (
@@ -143,6 +145,61 @@ func isWorkloadExcluded(namespace, name string, labels map[string]string) bool {
 	return false
 }
 
+func unhealthyPodEvictionStr(p *policyv1.UnhealthyPodEvictionPolicyType) string {
+	if p == nil {
+		return "<unset>"
+	}
+	return string(*p)
+}
+
+// parseUnhealthyPodEvictionPolicy parses ConfigMap or annotation values for PodDisruptionBudget.spec.unhealthyPodEvictionPolicy (Kubernetes 1.26+).
+// Empty string returns nil (omit field; API default applies). Valid values: IfHealthyBudget, AlwaysAllow (case-insensitive).
+func parseUnhealthyPodEvictionPolicy(s string) *policyv1.UnhealthyPodEvictionPolicyType {
+	s = strings.TrimSpace(s)
+	if s == "" {
+		return nil
+	}
+	switch strings.ToLower(s) {
+	case strings.ToLower(string(policyv1.IfHealthyBudget)):
+		p := policyv1.IfHealthyBudget
+		return &p
+	case strings.ToLower(string(policyv1.AlwaysAllow)):
+		p := policyv1.AlwaysAllow
+		return &p
+	default:
+		logWarnf("Invalid unhealthyPodEvictionPolicy %q (valid: IfHealthyBudget, AlwaysAllow); ignoring", s)
+		return nil
+	}
+}
+
+func resolveUnhealthyPodEvictionPolicy(workloadAnnotations map[string]string) *policyv1.UnhealthyPodEvictionPolicyType {
+	if workloadAnnotations != nil {
+		if v, ok := workloadAnnotations[annotationUnhealthyPodEvictionPolicy]; ok {
+			if p := parseUnhealthyPodEvictionPolicy(v); p != nil {
+				return p
+			}
+		}
+	}
+	defaultPDBConfigLock.RLock()
+	def := defaultPDBConfig.UnhealthyPodEvictionPolicy
+	defaultPDBConfigLock.RUnlock()
+	if def == nil {
+		return nil
+	}
+	c := *def
+	return &c
+}
+
+func unhealthyPodEvictionPoliciesEqual(a, b *policyv1.UnhealthyPodEvictionPolicyType) bool {
+	if a == nil && b == nil {
+		return true
+	}
+	if a == nil || b == nil {
+		return false
+	}
+	return *a == *b
+}
+
 // updateExistingPDB updates an existing castai PDB with new configuration
 func updateExistingPDB(ctx context.Context, clientset *kubernetes.Clientset, existingPDB *policyv1.PodDisruptionBudget, workloadAnnotations map[string]string, replicas *int32, namespace, name string, obj interface{}) {
 	// Parse PDB configuration from annotations or defaults
@@ -183,6 +240,8 @@ func updateExistingPDB(ctx context.Context, clientset *kubernetes.Clientset, exi
 		pdbSpec.MaxUnavailable = maxUnavailable
 	}
 
+	pdbSpec.UnhealthyPodEvictionPolicy = resolveUnhealthyPodEvictionPolicy(workloadAnnotations)
+
 	// Check if update is needed
 	if existingPDB.Spec.MinAvailable == nil && pdbSpec.MinAvailable != nil {
 		needsUpdate = true
@@ -202,6 +261,10 @@ func updateExistingPDB(ctx context.Context, clientset *kubernetes.Clientset, exi
 		if existingPDB.Spec.MaxUnavailable.String() != pdbSpec.MaxUnavailable.String() {
 			needsUpdate = true
 		}
+	}
+
+	if !unhealthyPodEvictionPoliciesEqual(existingPDB.Spec.UnhealthyPodEvictionPolicy, pdbSpec.UnhealthyPodEvictionPolicy) {
+		needsUpdate = true
 	}
 
 	if needsUpdate {
@@ -525,9 +588,15 @@ func updateDefaultPDBConfig(ctx context.Context, cm *corev1.ConfigMap, clientset
 		logDebugf("No exclusions found in ConfigMap")
 	}
 
+	var unhealthyPodEviction *policyv1.UnhealthyPodEvictionPolicyType
+	if val, ok := cm.Data["defaultUnhealthyPodEvictionPolicy"]; ok {
+		unhealthyPodEviction = parseUnhealthyPodEvictionPolicy(val)
+	}
+
 	defaultPDBConfigLock.Lock()
 	defaultPDBConfig.MinAvailable = minAvailable
 	defaultPDBConfig.MaxUnavailable = maxUnavailable
+	defaultPDBConfig.UnhealthyPodEvictionPolicy = unhealthyPodEviction
 	defaultPDBConfig.FixPoorPDBs = fixPoorPDBs
 	defaultPDBConfig.LogInterval = logInterval
 	defaultPDBConfig.PDBScanInterval = pdbScanInterval
@@ -536,9 +605,9 @@ func updateDefaultPDBConfig(ctx context.Context, cm *corev1.ConfigMap, clientset
 	defaultPDBConfig.Exclusions = exclusions
 	defaultPDBConfigLock.Unlock()
 
-	logInfof("Default PDB config updated from ConfigMap: defaultMinAvailable=%v, defaultMaxUnavailable=%v, FixPoorPDBs=%v, "+
+	logInfof("Default PDB config updated from ConfigMap: defaultMinAvailable=%v, defaultMaxUnavailable=%v, defaultUnhealthyPodEvictionPolicy=%v, FixPoorPDBs=%v, "+
 		"logInterval=%v, pdbScanInterval=%v, garbageCollectInterval=%v, pdbDumpInterval=%v, exclusions=%d rules\n",
-		minAvailable, maxUnavailable, fixPoorPDBs, logInterval, pdbScanInterval,
+		minAvailable, maxUnavailable, unhealthyPodEvictionStr(unhealthyPodEviction), fixPoorPDBs, logInterval, pdbScanInterval,
 		garbageCollectInterval, pdbDumpInterval, len(exclusions))
 
 	logDebugf("Final exclusion rules loaded: %d rules", len(exclusions))
@@ -564,6 +633,7 @@ func resetDefaultPDBConfig() {
 	defaultPDBConfig.GarbageCollectInterval = defaultGarbageCollectInterval
 	defaultPDBConfig.PDBDumpInterval = defaultPDBDumpInterval
 	defaultPDBConfig.Exclusions = nil
+	defaultPDBConfig.UnhealthyPodEvictionPolicy = nil
 	defaultPDBConfigLock.Unlock()
 	syncLogLevelFromData(nil)
 	logInfof("Default PDB config reset: using built-in fallback\n")
@@ -1087,6 +1157,8 @@ func createPDBForWorkload(ctx context.Context, clientset *kubernetes.Clientset, 
 		pdbSpec.MaxUnavailable = maxUnavailable
 	}
 
+	pdbSpec.UnhealthyPodEvictionPolicy = resolveUnhealthyPodEvictionPolicy(workloadAnnotations)
+
 	if exists {
 		needsUpdate := false
 		if existingPDB.Spec.MinAvailable == nil && pdbSpec.MinAvailable != nil {
@@ -1103,6 +1175,9 @@ func createPDBForWorkload(ctx context.Context, clientset *kubernetes.Clientset, 
 			needsUpdate = true
 		} else if existingPDB.Spec.MaxUnavailable != nil && pdbSpec.MaxUnavailable != nil &&
 			existingPDB.Spec.MaxUnavailable.String() != pdbSpec.MaxUnavailable.String() {
+			needsUpdate = true
+		}
+		if !unhealthyPodEvictionPoliciesEqual(existingPDB.Spec.UnhealthyPodEvictionPolicy, pdbSpec.UnhealthyPodEvictionPolicy) {
 			needsUpdate = true
 		}
 		if needsUpdate {
@@ -1323,6 +1398,9 @@ func hasCustomPDBAnnotations(annotations map[string]string) bool {
 		return true
 	}
 	if _, ok := annotations[annotationMaxUnavailable]; ok {
+		return true
+	}
+	if _, ok := annotations[annotationUnhealthyPodEvictionPolicy]; ok {
 		return true
 	}
 	return false
