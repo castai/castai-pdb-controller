@@ -74,6 +74,7 @@ helm install castai-pdb-controller castai/castai-pdb-controller \
 | `config.logLevel` | Application log level: `debug`, `info`, `warn`, `error` | `"info"` |
 | `config.defaultUnhealthyPodEvictionPolicy` | PDB `unhealthyPodEvictionPolicy` default (K8s 1.26+): `IfHealthyBudget`, `AlwaysAllow`, or `""` to omit | `""` |
 | `config.exclusions` | YAML list of exclusion rules for workloads | `[]` (empty) |
+| `config.additionalSelectorLabels` | YAM list of additional labels to add to the PDB Selector | `[]` (empty) |
 | `resources.limits.cpu` | CPU limit | `500m` |
 | `resources.limits.memory` | Memory limit | `512Mi` |
 | `resources.requests.cpu` | CPU request | `100m` |

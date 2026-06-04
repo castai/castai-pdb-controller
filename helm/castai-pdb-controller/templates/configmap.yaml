@@ -28,4 +28,8 @@ data:
   {{- if .Values.config.exclusions }}
   exclusions: |
 {{ toYaml .Values.config.exclusions | indent 4 }}
+  {{- end }}
+  {{- if .Values.config.additionalSelectorLabels }}
+  additionalSelectorLabels: |
+{{ toYaml .Values.config.additionalSelectorLabels | indent 4 }}
   {{- end }} 

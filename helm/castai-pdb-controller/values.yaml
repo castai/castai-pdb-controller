@@ -62,6 +62,15 @@ config:
       namespaceRegex: ""
       labels: {}
 
+  # Additional label keys whose values, if present on the workload's pod template, are added to the
+  # PDB matchLabels selector. Keys absent from the pod template are silently skipped. This enables
+  # more specific PDB selectors without breaking workloads that do not carry these labels.
+  # Example:
+  #   additionalSelectorLabels:
+  #     - app.kubernetes.io/version
+  #     - my-org/environment
+  additionalSelectorLabels: []
+
 # Resource configuration
 resources:
   limits:
