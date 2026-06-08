@@ -1,6 +1,6 @@
 module github.com/yourname/castai-pdb-controller
 
-go 1.26
+go 1.26.4
 
 require (
 	k8s.io/api v0.33.1

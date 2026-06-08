@@ -302,55 +302,51 @@ func TestEnrichSelectorWithAdditionalLabels(t *testing.T) {
 	})
 }
 
-// TestAdditionalSelectorLabels_ShiptRealWorld verifies enrichment using realistic
-// label data mirroring the surge-pay deployment. The deployment selector is
-// {app, release} and the pod template carries many labels including
-// shipt-app-role and shipt-app-role-name. When those keys are configured as
-// additionalSelectorLabels, the PDB selector should gain them; when they are
-// absent from the pod template, the selector should be left unchanged.
-func TestAdditionalSelectorLabels_ShiptRealWorld(t *testing.T) {
+// TestAdditionalSelectorLabels_RealWorld verifies enrichment using realistic
+// label data. The deployment selector is {app, release} and the pod template
+// carries many labels including role and role-name. When those keys are
+// configured as additionalSelectorLabels, the PDB selector should gain them;
+// when they are absent from the pod template, the selector should be left
+// unchanged.
+func TestAdditionalSelectorLabels_RealWorld(t *testing.T) {
 	t.Parallel()
 
-	// Labels that live on spec.template.metadata.labels of the surge-pay deployment.
-	surgepayPodTemplateLabels := map[string]string{
-		"app":                          "surge-pay",
-		"release":                      "surge-pay",
-		"chart":                        "surge-pay-1.0.0",
-		"heritage":                     "Helm",
-		"pipeline":                     "gitlab-ci",
-		"team":                         "payments",
-		"shipt-app-role":               "worker",
-		"shipt-app-role-name":          "aggregated-bundles-worker",
-		"tags.datadoghq.com/env":       "prod",
-		"tags.datadoghq.com/service":   "surge-pay",
-		"tags.datadoghq.com/version":   "abc123",
+	// Labels that live on spec.template.metadata.labels of a typical deployment.
+	podTemplateLabels := map[string]string{
+		"app":       "my-app",
+		"release":   "my-app",
+		"chart":     "my-app-1.0.0",
+		"heritage":  "Helm",
+		"team":      "platform",
+		"role":      "worker",
+		"role-name": "worker-pool-a",
 	}
 
 	// The deployment's spec.selector.matchLabels — the baseline for the PDB.
 	baseDeploymentSelector := func() *metav1.LabelSelector {
 		return &metav1.LabelSelector{
 			MatchLabels: map[string]string{
-				"app":     "surge-pay",
-				"release": "surge-pay",
+				"app":     "my-app",
+				"release": "my-app",
 			},
 		}
 	}
 
-	t.Run("both shipt-app-role and shipt-app-role-name present in pod template are added to PDB selector", func(t *testing.T) {
+	t.Run("both role and role-name present in pod template are added to PDB selector", func(t *testing.T) {
 		sel := baseDeploymentSelector()
 		got := enrichSelectorWithAdditionalLabels(
 			sel,
-			surgepayPodTemplateLabels,
-			[]string{"shipt-app-role", "shipt-app-role-name"},
+			podTemplateLabels,
+			[]string{"role", "role-name"},
 		)
-		if got.MatchLabels["shipt-app-role"] != "worker" {
-			t.Errorf("expected shipt-app-role=worker, got %q", got.MatchLabels["shipt-app-role"])
+		if got.MatchLabels["role"] != "worker" {
+			t.Errorf("expected role=worker, got %q", got.MatchLabels["role"])
 		}
-		if got.MatchLabels["shipt-app-role-name"] != "aggregated-bundles-worker" {
-			t.Errorf("expected shipt-app-role-name=aggregated-bundles-worker, got %q", got.MatchLabels["shipt-app-role-name"])
+		if got.MatchLabels["role-name"] != "worker-pool-a" {
+			t.Errorf("expected role-name=worker-pool-a, got %q", got.MatchLabels["role-name"])
 		}
 		// Original deployment selector labels must still be present.
-		if got.MatchLabels["app"] != "surge-pay" || got.MatchLabels["release"] != "surge-pay" {
+		if got.MatchLabels["app"] != "my-app" || got.MatchLabels["release"] != "my-app" {
 			t.Errorf("deployment selector labels should be preserved, got %v", got.MatchLabels)
 		}
 		// Only the two configured keys should be added — not every pod template label.
@@ -359,44 +355,44 @@ func TestAdditionalSelectorLabels_ShiptRealWorld(t *testing.T) {
 		}
 	})
 
-	t.Run("only shipt-app-role present in pod template when shipt-app-role-name is absent", func(t *testing.T) {
-		// Simulate a deployment whose pod template only has shipt-app-role.
+	t.Run("only role present in pod template when role-name is absent", func(t *testing.T) {
+		// Simulate a deployment whose pod template only has role.
 		partialPodLabels := map[string]string{
-			"app":            "surge-pay",
-			"release":        "surge-pay",
-			"shipt-app-role": "worker",
-			// shipt-app-role-name intentionally omitted
+			"app":     "my-app",
+			"release": "my-app",
+			"role":    "worker",
+			// role-name intentionally omitted
 		}
 		sel := baseDeploymentSelector()
 		got := enrichSelectorWithAdditionalLabels(
 			sel,
 			partialPodLabels,
-			[]string{"shipt-app-role", "shipt-app-role-name"},
+			[]string{"role", "role-name"},
 		)
-		if got.MatchLabels["shipt-app-role"] != "worker" {
-			t.Errorf("expected shipt-app-role=worker, got %q", got.MatchLabels["shipt-app-role"])
+		if got.MatchLabels["role"] != "worker" {
+			t.Errorf("expected role=worker, got %q", got.MatchLabels["role"])
 		}
-		if _, ok := got.MatchLabels["shipt-app-role-name"]; ok {
-			t.Errorf("shipt-app-role-name should be absent when not on pod template, got %v", got.MatchLabels)
+		if _, ok := got.MatchLabels["role-name"]; ok {
+			t.Errorf("role-name should be absent when not on pod template, got %v", got.MatchLabels)
 		}
 	})
 
-	t.Run("neither shipt label in pod template leaves selector unchanged", func(t *testing.T) {
-		labelsWithoutShipt := map[string]string{
-			"app":     "surge-pay",
-			"release": "surge-pay",
-			"team":    "payments",
+	t.Run("neither configured label in pod template leaves selector unchanged", func(t *testing.T) {
+		labelsWithoutConfigured := map[string]string{
+			"app":     "my-app",
+			"release": "my-app",
+			"team":    "platform",
 		}
 		sel := baseDeploymentSelector()
 		got := enrichSelectorWithAdditionalLabels(
 			sel,
-			labelsWithoutShipt,
-			[]string{"shipt-app-role", "shipt-app-role-name"},
+			labelsWithoutConfigured,
+			[]string{"role", "role-name"},
 		)
 		if len(got.MatchLabels) != 2 {
 			t.Errorf("expected selector to stay at 2 keys, got %d: %v", len(got.MatchLabels), got.MatchLabels)
 		}
-		if got.MatchLabels["app"] != "surge-pay" || got.MatchLabels["release"] != "surge-pay" {
+		if got.MatchLabels["app"] != "my-app" || got.MatchLabels["release"] != "my-app" {
 			t.Errorf("original deployment selector should be unchanged, got %v", got.MatchLabels)
 		}
 	})
