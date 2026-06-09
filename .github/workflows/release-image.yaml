@@ -102,6 +102,9 @@ jobs:
             helm repo index helm-repo --url https://castai.github.io/castai-pdb-controller
           fi
 
+      - name: Copy index page
+        run: cp helm/index.html helm-repo/index.html
+
       - name: Setup Pages
         uses: actions/configure-pages@45bfe0192ca1faeb007ade9deae92b16b8254a0d # v6.0.0
 
