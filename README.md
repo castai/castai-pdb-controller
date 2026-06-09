@@ -36,6 +36,9 @@ This controller enables safe, automated disruption management with per-workload 
 - **Leader Election:**  
   Supports safe, highly available operation in multi-replica controller deployments.
 
+- **Additional PDB Selector Labels:**  
+  Optionally extend PDB `matchLabels` with extra labels drawn from each workload's pod template. Configure a list of label keys in the ConfigMap and the controller will add them to the PDB selector when they are present on the pod template — silently skipping any keys that are absent.
+
 - **Configurable log levels:**  
   Set `logLevel` in the `castai-pdb-controller-config` ConfigMap to `debug`, `info`, `warn`, or `error` (default `info`) to control how much the controller writes to stderr.
 
@@ -107,7 +110,52 @@ data:
 
 ---
 
-### 3. **Per-Workload Annotations**
+### 3. **Additional PDB Selector Labels**
+
+By default, the controller builds a PDB selector using only the labels from `spec.selector.matchLabels` on the Deployment or StatefulSet. You can extend this with extra labels from the workload's pod template by listing their keys under `additionalSelectorLabels` in the ConfigMap:
+
+```yaml
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: castai-pdb-controller-config
+  namespace: castai-agent
+data:
+  minAvailable: "1"
+  additionalSelectorLabels: |
+    - role
+    - component
+```
+
+**How it works:**
+- For each key in `additionalSelectorLabels`, the controller looks it up in the workload's `spec.template.metadata.labels`.
+- If the label is present, its key/value is added to the PDB's `matchLabels`.
+- If the label is absent, it is silently skipped — the controller never fails due to a missing label.
+- Labels already present in the deployment selector are never overwritten.
+
+**Example:** a Deployment whose pod template carries `role: worker` and `component: api` and whose `spec.selector.matchLabels` is `{app: my-app, release: my-app}` will produce a PDB with:
+
+```yaml
+selector:
+  matchLabels:
+    app: my-app
+    release: my-app
+    role: worker
+    component: api
+```
+
+**Helm:** set `config.additionalSelectorLabels` in `values.yaml`:
+
+```yaml
+config:
+  additionalSelectorLabels:
+    - role
+    - component
+```
+
+---
+
+### 4. **Per-Workload Annotations**
 
 Add annotations to your Deployment or StatefulSet to override the defaults:
 

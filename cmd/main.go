@@ -64,6 +64,7 @@ type DefaultPDBConfig struct {
 	GarbageCollectInterval     time.Duration
 	PDBDumpInterval            time.Duration
 	Exclusions                 []ExclusionRule
+	AdditionalSelectorLabels   []string
 }
 
 var (
@@ -201,6 +202,38 @@ func unhealthyPodEvictionPoliciesEqual(a, b *policyv1.UnhealthyPodEvictionPolicy
 }
 
 // updateExistingPDB updates an existing castai PDB with new configuration
+// pdbSpecNeedsUpdate checks if the new PDB spec differs from the existing one (MinAvailable, MaxUnavailable, UnhealthyPodEvictionPolicy).
+func pdbSpecNeedsUpdate(existing, desired *policyv1.PodDisruptionBudgetSpec) bool {
+	// Check MinAvailable
+	if existing.MinAvailable == nil && desired.MinAvailable != nil {
+		return true
+	} else if existing.MinAvailable != nil && desired.MinAvailable == nil {
+		return true
+	} else if existing.MinAvailable != nil && desired.MinAvailable != nil {
+		if existing.MinAvailable.String() != desired.MinAvailable.String() {
+			return true
+		}
+	}
+
+	// Check MaxUnavailable
+	if existing.MaxUnavailable == nil && desired.MaxUnavailable != nil {
+		return true
+	} else if existing.MaxUnavailable != nil && desired.MaxUnavailable == nil {
+		return true
+	} else if existing.MaxUnavailable != nil && desired.MaxUnavailable != nil {
+		if existing.MaxUnavailable.String() != desired.MaxUnavailable.String() {
+			return true
+		}
+	}
+
+	// Check UnhealthyPodEvictionPolicy
+	if !unhealthyPodEvictionPoliciesEqual(existing.UnhealthyPodEvictionPolicy, desired.UnhealthyPodEvictionPolicy) {
+		return true
+	}
+
+	return false
+}
+
 func updateExistingPDB(ctx context.Context, clientset *kubernetes.Clientset, existingPDB *policyv1.PodDisruptionBudget, workloadAnnotations map[string]string, replicas *int32, namespace, name string, obj interface{}) {
 	// Parse PDB configuration from annotations or defaults
 	var minAvailable, maxUnavailable *intstr.IntOrString
@@ -242,30 +275,49 @@ func updateExistingPDB(ctx context.Context, clientset *kubernetes.Clientset, exi
 
 	pdbSpec.UnhealthyPodEvictionPolicy = resolveUnhealthyPodEvictionPolicy(workloadAnnotations)
 
+	// Enrich selector with additional labels (same as in createPDBForWorkload)
+	var podTemplateLabels map[string]string
+	switch workload := obj.(type) {
+	case *appsv1.Deployment:
+		podTemplateLabels = workload.Spec.Template.Labels
+	case *appsv1.StatefulSet:
+		podTemplateLabels = workload.Spec.Template.Labels
+	}
+
+	defaultPDBConfigLock.RLock()
+	additionalSelectorLabels := defaultPDBConfig.AdditionalSelectorLabels
+	defaultPDBConfigLock.RUnlock()
+
+	enrichedSelector := enrichSelectorWithAdditionalLabels(pdbSpec.Selector, podTemplateLabels, additionalSelectorLabels)
+	pdbSpec.Selector = enrichedSelector
+
+	// Check if selector changed (immutable field requires delete & recreate)
+	if existingPDB.Spec.Selector != nil && enrichedSelector != nil {
+		existingPDBSel, err := metav1.LabelSelectorAsSelector(existingPDB.Spec.Selector)
+		if err != nil {
+			logErrorf("Failed to parse existing PDB selector for %s/%s: %v, will delete and recreate\n", namespace, name, err)
+			// Delete and recreate if parsing fails
+			err := clientset.PolicyV1().PodDisruptionBudgets(namespace).Delete(ctx, existingPDB.Name, metav1.DeleteOptions{})
+			if err != nil {
+				logErrorf("Failed to delete malformed PDB %s/%s: %v\n", namespace, name, err)
+			}
+			return
+		}
+		enrichedSel, _ := metav1.LabelSelectorAsSelector(enrichedSelector)
+		if existingPDBSel.String() != enrichedSel.String() {
+			// Selectors differ; delete and recreate
+			err := clientset.PolicyV1().PodDisruptionBudgets(namespace).Delete(ctx, existingPDB.Name, metav1.DeleteOptions{})
+			if err != nil {
+				logErrorf("Failed to delete PDB %s/%s for recreation: %v\n", namespace, name, err)
+				return
+			}
+			logInfof("Deleted PDB %s/%s due to selector change, will recreate\n", namespace, name)
+			return
+		}
+	}
+
 	// Check if update is needed
-	if existingPDB.Spec.MinAvailable == nil && pdbSpec.MinAvailable != nil {
-		needsUpdate = true
-	} else if existingPDB.Spec.MinAvailable != nil && pdbSpec.MinAvailable == nil {
-		needsUpdate = true
-	} else if existingPDB.Spec.MinAvailable != nil && pdbSpec.MinAvailable != nil {
-		if existingPDB.Spec.MinAvailable.String() != pdbSpec.MinAvailable.String() {
-			needsUpdate = true
-		}
-	}
-
-	if existingPDB.Spec.MaxUnavailable == nil && pdbSpec.MaxUnavailable != nil {
-		needsUpdate = true
-	} else if existingPDB.Spec.MaxUnavailable != nil && pdbSpec.MaxUnavailable == nil {
-		needsUpdate = true
-	} else if existingPDB.Spec.MaxUnavailable != nil && pdbSpec.MaxUnavailable != nil {
-		if existingPDB.Spec.MaxUnavailable.String() != pdbSpec.MaxUnavailable.String() {
-			needsUpdate = true
-		}
-	}
-
-	if !unhealthyPodEvictionPoliciesEqual(existingPDB.Spec.UnhealthyPodEvictionPolicy, pdbSpec.UnhealthyPodEvictionPolicy) {
-		needsUpdate = true
-	}
+	needsUpdate = pdbSpecNeedsUpdate(&existingPDB.Spec, &pdbSpec)
 
 	if needsUpdate {
 		existingPDB.Spec = pdbSpec
@@ -593,6 +645,15 @@ func updateDefaultPDBConfig(ctx context.Context, cm *corev1.ConfigMap, clientset
 		unhealthyPodEviction = parseUnhealthyPodEvictionPolicy(val)
 	}
 
+	// Parse additional selector label keys from ConfigMap
+	var additionalSelectorLabels []string
+	if raw, ok := cm.Data["additionalSelectorLabels"]; ok && raw != "" {
+		if err := yaml.Unmarshal([]byte(raw), &additionalSelectorLabels); err != nil {
+			logWarnf("Warning: failed to parse additionalSelectorLabels from ConfigMap: %v\n", err)
+			additionalSelectorLabels = nil
+		}
+	}
+
 	defaultPDBConfigLock.Lock()
 	defaultPDBConfig.MinAvailable = minAvailable
 	defaultPDBConfig.MaxUnavailable = maxUnavailable
@@ -603,12 +664,13 @@ func updateDefaultPDBConfig(ctx context.Context, cm *corev1.ConfigMap, clientset
 	defaultPDBConfig.GarbageCollectInterval = garbageCollectInterval
 	defaultPDBConfig.PDBDumpInterval = pdbDumpInterval
 	defaultPDBConfig.Exclusions = exclusions
+	defaultPDBConfig.AdditionalSelectorLabels = additionalSelectorLabels
 	defaultPDBConfigLock.Unlock()
 
 	logInfof("Default PDB config updated from ConfigMap: defaultMinAvailable=%v, defaultMaxUnavailable=%v, defaultUnhealthyPodEvictionPolicy=%v, FixPoorPDBs=%v, "+
-		"logInterval=%v, pdbScanInterval=%v, garbageCollectInterval=%v, pdbDumpInterval=%v, exclusions=%d rules\n",
+		"logInterval=%v, pdbScanInterval=%v, garbageCollectInterval=%v, pdbDumpInterval=%v, exclusions=%d rules, additionalSelectorLabels=%v\n",
 		minAvailable, maxUnavailable, unhealthyPodEvictionStr(unhealthyPodEviction), fixPoorPDBs, logInterval, pdbScanInterval,
-		garbageCollectInterval, pdbDumpInterval, len(exclusions))
+		garbageCollectInterval, pdbDumpInterval, len(exclusions), additionalSelectorLabels)
 
 	logDebugf("Final exclusion rules loaded: %d rules", len(exclusions))
 	for i, rule := range exclusions {
@@ -633,10 +695,33 @@ func resetDefaultPDBConfig() {
 	defaultPDBConfig.GarbageCollectInterval = defaultGarbageCollectInterval
 	defaultPDBConfig.PDBDumpInterval = defaultPDBDumpInterval
 	defaultPDBConfig.Exclusions = nil
+	defaultPDBConfig.AdditionalSelectorLabels = nil
 	defaultPDBConfig.UnhealthyPodEvictionPolicy = nil
 	defaultPDBConfigLock.Unlock()
 	syncLogLevelFromData(nil)
 	logInfof("Default PDB config reset: using built-in fallback\n")
+}
+
+// enrichSelectorWithAdditionalLabels returns a deep copy of the selector with any keys from
+// additionalKeys that are present in podTemplateLabels appended to MatchLabels. Keys absent
+// from podTemplateLabels are silently skipped. Existing MatchLabels keys are never overwritten.
+func enrichSelectorWithAdditionalLabels(selector *metav1.LabelSelector, podTemplateLabels map[string]string, additionalKeys []string) *metav1.LabelSelector {
+	if selector == nil || len(additionalKeys) == 0 || len(podTemplateLabels) == 0 {
+		return selector
+	}
+	enriched := selector.DeepCopy()
+	if enriched.MatchLabels == nil {
+		enriched.MatchLabels = make(map[string]string)
+	}
+	for _, key := range additionalKeys {
+		if _, alreadyPresent := enriched.MatchLabels[key]; alreadyPresent {
+			continue
+		}
+		if val, inTemplate := podTemplateLabels[key]; inTemplate {
+			enriched.MatchLabels[key] = val
+		}
+	}
+	return enriched
 }
 
 // loads the configmap values
@@ -974,12 +1059,19 @@ func createPDBForWorkload(ctx context.Context, clientset *kubernetes.Clientset, 
 		namespace, name     string
 		workloadAnnotations map[string]string
 		replicas            *int32
+		podTemplateLabels   map[string]string
 	)
 
 	switch workload := obj.(type) {
 	case *appsv1.Deployment:
 		replicas = workload.Spec.Replicas
 		if replicas == nil || *replicas < 2 {
+			pdbName := fmt.Sprintf("castai-%s-pdb", workload.Name)
+			logInfof("Workload %s/%s has fewer than 2 replicas; deleting PDB %s to prevent blocking disruptions\n", workload.Namespace, workload.Name, pdbName)
+			err := clientset.PolicyV1().PodDisruptionBudgets(workload.Namespace).Delete(ctx, pdbName, metav1.DeleteOptions{})
+			if err != nil && !apierrors.IsNotFound(err) {
+				logErrorf("Failed to delete PDB %s/%s for scaled-down workload: %v\n", workload.Namespace, pdbName, err)
+			}
 			return
 		}
 		if workload.Annotations != nil {
@@ -991,6 +1083,7 @@ func createPDBForWorkload(ctx context.Context, clientset *kubernetes.Clientset, 
 		workloadAnnotations = workload.Annotations
 		namespace = workload.Namespace
 		name = workload.Name
+		podTemplateLabels = workload.Spec.Template.Labels
 
 		// Check if workload should be excluded
 		logDebugf("About to check exclusions for %s/%s", namespace, name)
@@ -1002,6 +1095,12 @@ func createPDBForWorkload(ctx context.Context, clientset *kubernetes.Clientset, 
 	case *appsv1.StatefulSet:
 		replicas = workload.Spec.Replicas
 		if replicas == nil || *replicas < 2 {
+			pdbName := fmt.Sprintf("castai-%s-pdb", workload.Name)
+			logInfof("Workload %s/%s has fewer than 2 replicas; deleting PDB %s to prevent blocking disruptions\n", workload.Namespace, workload.Name, pdbName)
+			err := clientset.PolicyV1().PodDisruptionBudgets(workload.Namespace).Delete(ctx, pdbName, metav1.DeleteOptions{})
+			if err != nil && !apierrors.IsNotFound(err) {
+				logErrorf("Failed to delete PDB %s/%s for scaled-down workload: %v\n", workload.Namespace, pdbName, err)
+			}
 			return
 		}
 		if workload.Annotations != nil {
@@ -1013,6 +1112,7 @@ func createPDBForWorkload(ctx context.Context, clientset *kubernetes.Clientset, 
 		workloadAnnotations = workload.Annotations
 		namespace = workload.Namespace
 		name = workload.Name
+		podTemplateLabels = workload.Spec.Template.Labels
 
 		// Check if workload should be excluded
 		logDebugf("About to check exclusions for %s/%s", namespace, name)
@@ -1028,6 +1128,12 @@ func createPDBForWorkload(ctx context.Context, clientset *kubernetes.Clientset, 
 	if selector == nil {
 		return
 	}
+
+	// Enrich selector with any additional label keys configured via ConfigMap, if present on pod template
+	defaultPDBConfigLock.RLock()
+	additionalSelectorLabels := defaultPDBConfig.AdditionalSelectorLabels
+	defaultPDBConfigLock.RUnlock()
+	selector = enrichSelectorWithAdditionalLabels(selector, podTemplateLabels, additionalSelectorLabels)
 
 	workloadSel, err := metav1.LabelSelectorAsSelector(selector)
 	if err != nil {
@@ -1160,39 +1266,89 @@ func createPDBForWorkload(ctx context.Context, clientset *kubernetes.Clientset, 
 	pdbSpec.UnhealthyPodEvictionPolicy = resolveUnhealthyPodEvictionPolicy(workloadAnnotations)
 
 	if exists {
-		needsUpdate := false
-		if existingPDB.Spec.MinAvailable == nil && pdbSpec.MinAvailable != nil {
-			needsUpdate = true
-		} else if existingPDB.Spec.MinAvailable != nil && pdbSpec.MinAvailable == nil {
-			needsUpdate = true
-		} else if existingPDB.Spec.MinAvailable != nil && pdbSpec.MinAvailable != nil &&
-			existingPDB.Spec.MinAvailable.String() != pdbSpec.MinAvailable.String() {
-			needsUpdate = true
-		}
-		if existingPDB.Spec.MaxUnavailable == nil && pdbSpec.MaxUnavailable != nil {
-			needsUpdate = true
-		} else if existingPDB.Spec.MaxUnavailable != nil && pdbSpec.MaxUnavailable == nil {
-			needsUpdate = true
-		} else if existingPDB.Spec.MaxUnavailable != nil && pdbSpec.MaxUnavailable != nil &&
-			existingPDB.Spec.MaxUnavailable.String() != pdbSpec.MaxUnavailable.String() {
-			needsUpdate = true
-		}
-		if !unhealthyPodEvictionPoliciesEqual(existingPDB.Spec.UnhealthyPodEvictionPolicy, pdbSpec.UnhealthyPodEvictionPolicy) {
-			needsUpdate = true
-		}
-		if needsUpdate {
-			existingPDB.Spec = pdbSpec
-			_, err := clientset.PolicyV1().PodDisruptionBudgets(namespace).Update(ctx, existingPDB, metav1.UpdateOptions{})
-			if err != nil {
-				logErrorf("Failed to update PDB for %s/%s: %v\n", namespace, name, err)
+		// PDB selectors are immutable; if the enriched selector differs from the existing one,
+		// we must delete the old PDB and fall through to create a new one.
+		if existingPDB.Spec.Selector != nil {
+			existingSel, err := metav1.LabelSelectorAsSelector(existingPDB.Spec.Selector)
+			newSel, err2 := metav1.LabelSelectorAsSelector(pdbSpec.Selector)
+			if err == nil && err2 == nil && existingSel.String() != newSel.String() {
+				logInfof("Selector changed for PDB %s/%s (was %q, now %q); deleting to recreate\n",
+					namespace, pdbName, existingSel.String(), newSel.String())
+				if delErr := clientset.PolicyV1().PodDisruptionBudgets(namespace).Delete(ctx, pdbName, metav1.DeleteOptions{}); delErr != nil && !apierrors.IsNotFound(delErr) {
+					logErrorf("Failed to delete PDB %s/%s for selector change: %v\n", namespace, pdbName, delErr)
+					return
+				}
+				// Fall through to the create block below
 			} else {
-				logInfof("Updated PDB for %s/%s\n", namespace, name)
-				if replicas != nil {
-					logAndFixPoorPDBConfig(ctx, clientset, existingPDB, name, *replicas, namespace, obj)
+				needsUpdate := false
+				if existingPDB.Spec.MinAvailable == nil && pdbSpec.MinAvailable != nil {
+					needsUpdate = true
+				} else if existingPDB.Spec.MinAvailable != nil && pdbSpec.MinAvailable == nil {
+					needsUpdate = true
+				} else if existingPDB.Spec.MinAvailable != nil && pdbSpec.MinAvailable != nil &&
+					existingPDB.Spec.MinAvailable.String() != pdbSpec.MinAvailable.String() {
+					needsUpdate = true
+				}
+				if existingPDB.Spec.MaxUnavailable == nil && pdbSpec.MaxUnavailable != nil {
+					needsUpdate = true
+				} else if existingPDB.Spec.MaxUnavailable != nil && pdbSpec.MaxUnavailable == nil {
+					needsUpdate = true
+				} else if existingPDB.Spec.MaxUnavailable != nil && pdbSpec.MaxUnavailable != nil &&
+					existingPDB.Spec.MaxUnavailable.String() != pdbSpec.MaxUnavailable.String() {
+					needsUpdate = true
+				}
+				if !unhealthyPodEvictionPoliciesEqual(existingPDB.Spec.UnhealthyPodEvictionPolicy, pdbSpec.UnhealthyPodEvictionPolicy) {
+					needsUpdate = true
+				}
+				if needsUpdate {
+					existingPDB.Spec = pdbSpec
+					_, err := clientset.PolicyV1().PodDisruptionBudgets(namespace).Update(ctx, existingPDB, metav1.UpdateOptions{})
+					if err != nil {
+						logErrorf("Failed to update PDB for %s/%s: %v\n", namespace, name, err)
+					} else {
+						logInfof("Updated PDB for %s/%s\n", namespace, name)
+						if replicas != nil {
+							logAndFixPoorPDBConfig(ctx, clientset, existingPDB, name, *replicas, namespace, obj)
+						}
+					}
+				}
+				return
+			}
+		} else {
+			needsUpdate := false
+			if existingPDB.Spec.MinAvailable == nil && pdbSpec.MinAvailable != nil {
+				needsUpdate = true
+			} else if existingPDB.Spec.MinAvailable != nil && pdbSpec.MinAvailable == nil {
+				needsUpdate = true
+			} else if existingPDB.Spec.MinAvailable != nil && pdbSpec.MinAvailable != nil &&
+				existingPDB.Spec.MinAvailable.String() != pdbSpec.MinAvailable.String() {
+				needsUpdate = true
+			}
+			if existingPDB.Spec.MaxUnavailable == nil && pdbSpec.MaxUnavailable != nil {
+				needsUpdate = true
+			} else if existingPDB.Spec.MaxUnavailable != nil && pdbSpec.MaxUnavailable == nil {
+				needsUpdate = true
+			} else if existingPDB.Spec.MaxUnavailable != nil && pdbSpec.MaxUnavailable != nil &&
+				existingPDB.Spec.MaxUnavailable.String() != pdbSpec.MaxUnavailable.String() {
+				needsUpdate = true
+			}
+			if !unhealthyPodEvictionPoliciesEqual(existingPDB.Spec.UnhealthyPodEvictionPolicy, pdbSpec.UnhealthyPodEvictionPolicy) {
+				needsUpdate = true
+			}
+			if needsUpdate {
+				existingPDB.Spec = pdbSpec
+				_, err := clientset.PolicyV1().PodDisruptionBudgets(namespace).Update(ctx, existingPDB, metav1.UpdateOptions{})
+				if err != nil {
+					logErrorf("Failed to update PDB for %s/%s: %v\n", namespace, name, err)
+				} else {
+					logInfof("Updated PDB for %s/%s\n", namespace, name)
+					if replicas != nil {
+						logAndFixPoorPDBConfig(ctx, clientset, existingPDB, name, *replicas, namespace, obj)
+					}
 				}
 			}
+			return
 		}
-		return
 	}
 
 	pdb := &policyv1.PodDisruptionBudget{
@@ -1337,6 +1493,7 @@ func workloadHasExistingPDB(ctx context.Context, clientset *kubernetes.Clientset
 	var selector *metav1.LabelSelector
 	var namespace, name string
 	var labels map[string]string
+	var podTemplateLabels map[string]string
 
 	switch workload := obj.(type) {
 	case *appsv1.Deployment:
@@ -1344,11 +1501,13 @@ func workloadHasExistingPDB(ctx context.Context, clientset *kubernetes.Clientset
 		namespace = workload.Namespace
 		name = workload.Name
 		labels = workload.Labels
+		podTemplateLabels = workload.Spec.Template.Labels
 	case *appsv1.StatefulSet:
 		selector = workload.Spec.Selector
 		namespace = workload.Namespace
 		name = workload.Name
 		labels = workload.Labels
+		podTemplateLabels = workload.Spec.Template.Labels
 	default:
 		return false
 	}
@@ -1364,6 +1523,12 @@ func workloadHasExistingPDB(ctx context.Context, clientset *kubernetes.Clientset
 	if selector == nil {
 		return false
 	}
+
+	// Apply the same enrichment as createPDBForWorkload so selector comparison is consistent
+	defaultPDBConfigLock.RLock()
+	additionalSelectorLabels := defaultPDBConfig.AdditionalSelectorLabels
+	defaultPDBConfigLock.RUnlock()
+	selector = enrichSelectorWithAdditionalLabels(selector, podTemplateLabels, additionalSelectorLabels)
 
 	workloadSel, err := metav1.LabelSelectorAsSelector(selector)
 	if err != nil {

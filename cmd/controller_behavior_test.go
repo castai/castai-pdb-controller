@@ -5,6 +5,7 @@ import (
 	"time"
 
 	policyv1 "k8s.io/api/policy/v1"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/util/intstr"
 )
 
@@ -233,4 +234,166 @@ func TestResolveUnhealthyPodEvictionPolicy_defaultsAndAnnotation(t *testing.T) {
 	if p := resolveUnhealthyPodEvictionPolicy(annSpaced); p == nil || *p != policyv1.IfHealthyBudget {
 		t.Fatalf("trimmed annotation: got %v", p)
 	}
+}
+
+func TestEnrichSelectorWithAdditionalLabels(t *testing.T) {
+	t.Parallel()
+
+	baseSelector := func() *metav1.LabelSelector {
+		return &metav1.LabelSelector{
+			MatchLabels: map[string]string{"app": "myapp"},
+		}
+	}
+
+	t.Run("empty additionalKeys returns selector unchanged", func(t *testing.T) {
+		sel := baseSelector()
+		got := enrichSelectorWithAdditionalLabels(sel, map[string]string{"env": "prod"}, nil)
+		if len(got.MatchLabels) != 1 || got.MatchLabels["app"] != "myapp" {
+			t.Fatalf("expected selector unchanged, got %v", got.MatchLabels)
+		}
+	})
+
+	t.Run("empty podTemplateLabels returns selector unchanged", func(t *testing.T) {
+		sel := baseSelector()
+		got := enrichSelectorWithAdditionalLabels(sel, nil, []string{"env"})
+		if len(got.MatchLabels) != 1 || got.MatchLabels["app"] != "myapp" {
+			t.Fatalf("expected selector unchanged, got %v", got.MatchLabels)
+		}
+	})
+
+	t.Run("label present in pod template is added to selector", func(t *testing.T) {
+		sel := baseSelector()
+		got := enrichSelectorWithAdditionalLabels(sel, map[string]string{"env": "prod", "other": "val"}, []string{"env"})
+		if got.MatchLabels["env"] != "prod" {
+			t.Fatalf("expected env=prod in selector, got %v", got.MatchLabels)
+		}
+		if got.MatchLabels["app"] != "myapp" {
+			t.Fatalf("original app label should be preserved, got %v", got.MatchLabels)
+		}
+	})
+
+	t.Run("label absent from pod template is silently skipped", func(t *testing.T) {
+		sel := baseSelector()
+		got := enrichSelectorWithAdditionalLabels(sel, map[string]string{"other": "val"}, []string{"env"})
+		if _, ok := got.MatchLabels["env"]; ok {
+			t.Fatalf("env label should not be present when absent from pod template, got %v", got.MatchLabels)
+		}
+	})
+
+	t.Run("key already in selector MatchLabels is not overwritten", func(t *testing.T) {
+		sel := &metav1.LabelSelector{
+			MatchLabels: map[string]string{"app": "myapp", "env": "staging"},
+		}
+		got := enrichSelectorWithAdditionalLabels(sel, map[string]string{"env": "prod"}, []string{"env"})
+		if got.MatchLabels["env"] != "staging" {
+			t.Fatalf("existing selector key should not be overwritten, got %v", got.MatchLabels)
+		}
+	})
+
+	t.Run("original selector is not mutated", func(t *testing.T) {
+		sel := baseSelector()
+		got := enrichSelectorWithAdditionalLabels(sel, map[string]string{"env": "prod"}, []string{"env"})
+		if _, ok := sel.MatchLabels["env"]; ok {
+			t.Fatal("original selector should not be mutated")
+		}
+		if got == sel {
+			t.Fatal("returned selector should be a copy, not the same pointer")
+		}
+	})
+}
+
+// TestAdditionalSelectorLabels_RealWorld verifies enrichment using realistic
+// label data. The deployment selector is {app, release} and the pod template
+// carries many labels including role and role-name. When those keys are
+// configured as additionalSelectorLabels, the PDB selector should gain them;
+// when they are absent from the pod template, the selector should be left
+// unchanged.
+func TestAdditionalSelectorLabels_RealWorld(t *testing.T) {
+	t.Parallel()
+
+	// Labels that live on spec.template.metadata.labels of a typical deployment.
+	podTemplateLabels := map[string]string{
+		"app":       "my-app",
+		"release":   "my-app",
+		"chart":     "my-app-1.0.0",
+		"heritage":  "Helm",
+		"team":      "platform",
+		"role":      "worker",
+		"role-name": "worker-pool-a",
+	}
+
+	// The deployment's spec.selector.matchLabels — the baseline for the PDB.
+	baseDeploymentSelector := func() *metav1.LabelSelector {
+		return &metav1.LabelSelector{
+			MatchLabels: map[string]string{
+				"app":     "my-app",
+				"release": "my-app",
+			},
+		}
+	}
+
+	t.Run("both role and role-name present in pod template are added to PDB selector", func(t *testing.T) {
+		sel := baseDeploymentSelector()
+		got := enrichSelectorWithAdditionalLabels(
+			sel,
+			podTemplateLabels,
+			[]string{"role", "role-name"},
+		)
+		if got.MatchLabels["role"] != "worker" {
+			t.Errorf("expected role=worker, got %q", got.MatchLabels["role"])
+		}
+		if got.MatchLabels["role-name"] != "worker-pool-a" {
+			t.Errorf("expected role-name=worker-pool-a, got %q", got.MatchLabels["role-name"])
+		}
+		// Original deployment selector labels must still be present.
+		if got.MatchLabels["app"] != "my-app" || got.MatchLabels["release"] != "my-app" {
+			t.Errorf("deployment selector labels should be preserved, got %v", got.MatchLabels)
+		}
+		// Only the two configured keys should be added — not every pod template label.
+		if len(got.MatchLabels) != 4 {
+			t.Errorf("expected exactly 4 keys in enriched selector, got %d: %v", len(got.MatchLabels), got.MatchLabels)
+		}
+	})
+
+	t.Run("only role present in pod template when role-name is absent", func(t *testing.T) {
+		// Simulate a deployment whose pod template only has role.
+		partialPodLabels := map[string]string{
+			"app":     "my-app",
+			"release": "my-app",
+			"role":    "worker",
+			// role-name intentionally omitted
+		}
+		sel := baseDeploymentSelector()
+		got := enrichSelectorWithAdditionalLabels(
+			sel,
+			partialPodLabels,
+			[]string{"role", "role-name"},
+		)
+		if got.MatchLabels["role"] != "worker" {
+			t.Errorf("expected role=worker, got %q", got.MatchLabels["role"])
+		}
+		if _, ok := got.MatchLabels["role-name"]; ok {
+			t.Errorf("role-name should be absent when not on pod template, got %v", got.MatchLabels)
+		}
+	})
+
+	t.Run("neither configured label in pod template leaves selector unchanged", func(t *testing.T) {
+		labelsWithoutConfigured := map[string]string{
+			"app":     "my-app",
+			"release": "my-app",
+			"team":    "platform",
+		}
+		sel := baseDeploymentSelector()
+		got := enrichSelectorWithAdditionalLabels(
+			sel,
+			labelsWithoutConfigured,
+			[]string{"role", "role-name"},
+		)
+		if len(got.MatchLabels) != 2 {
+			t.Errorf("expected selector to stay at 2 keys, got %d: %v", len(got.MatchLabels), got.MatchLabels)
+		}
+		if got.MatchLabels["app"] != "my-app" || got.MatchLabels["release"] != "my-app" {
+			t.Errorf("original deployment selector should be unchanged, got %v", got.MatchLabels)
+		}
+	})
 }
