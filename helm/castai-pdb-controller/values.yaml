@@ -6,7 +6,8 @@ replicaCount: 2
 image:
   # GCP Artifact Registry (castai-hub). Use imagePullSecrets on the pod if required for your cluster.
   repository: us-docker.pkg.dev/castai-hub/library/castai-pdb-controller
-  tag: "0.5"
+  # tag is set from the git tag at release time
+  tag: "0.0.0-dev"
   # Container image pull policy
   pullPolicy: IfNotPresent
 
