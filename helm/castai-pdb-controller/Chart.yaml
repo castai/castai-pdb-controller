@@ -2,7 +2,8 @@ apiVersion: v2
 name: castai-pdb-controller
 description: A Helm chart for CAST AI PDB Controller
 type: application
-version: 0.2.3
-appVersion: "0.5"
+# version and appVersion are set from the git tag at release time
+version: 0.0.0-dev
+appVersion: "0.0.0-dev"
 maintainers:
   - name: CAST AI 

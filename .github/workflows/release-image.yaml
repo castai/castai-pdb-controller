@@ -1,0 +1,115 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+jobs:
+  build-and-push-image:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - name: Checkout
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+
+      - name: Authenticate to Google Cloud
+        uses: google-github-actions/auth@7c6bc770dae815cd3e89ee6cdf493a5fab2cc093 # v3.0.0
+        with:
+          workload_identity_provider: ${{ secrets.GCP_WORKLOAD_IDENTITY_PROVIDER }}
+          service_account: ${{ secrets.GCP_SERVICE_ACCOUNT_EMAIL }}
+          audience: 'https://cloud.google.com'
+
+      - name: Configure Docker for GAR
+        run: gcloud auth configure-docker us-docker.pkg.dev
+
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@06116385d9baf250c9f4dcb4858b16962ea869c3 # v4.1.0
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@d7f5e7f509e45cec5c76c4d5afdd7de93d0b3df5 # v4.1.0
+
+      - name: Extract version
+        id: version
+        run: echo "tag=${GITHUB_REF_NAME#v}" >> "$GITHUB_OUTPUT"
+
+      - name: Build and push
+        uses: docker/build-push-action@f9f3042f7e2789586610d6e8b85c8f03e5195baf # v7.2.0
+        with:
+          context: .
+          push: true
+          platforms: linux/amd64,linux/arm64
+          tags: |
+            us-docker.pkg.dev/castai-hub/library/castai-pdb-controller:${{ steps.version.outputs.tag }}
+            us-docker.pkg.dev/castai-hub/library/castai-pdb-controller:latest
+
+  release-helm-chart:
+    needs: build-and-push-image
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    permissions:
+      contents: read
+      pages: write
+      id-token: write
+    steps:
+      - name: Checkout
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+
+      - name: Extract version
+        id: version
+        run: echo "tag=${GITHUB_REF_NAME#v}" >> "$GITHUB_OUTPUT"
+
+      - name: Update chart and image versions
+        run: |
+          yq -i ".version = \"${{ steps.version.outputs.tag }}\"" helm/castai-pdb-controller/Chart.yaml
+          yq -i ".appVersion = \"${{ steps.version.outputs.tag }}\"" helm/castai-pdb-controller/Chart.yaml
+          yq -i ".image.tag = \"${{ steps.version.outputs.tag }}\"" helm/castai-pdb-controller/values.yaml
+
+      - name: Set up Helm
+        uses: azure/setup-helm@dda3372f752e03dde6b3237bc9431cdc2f7a02a2 # v5.0.0
+
+      - name: Package Helm chart
+        run: helm package helm/castai-pdb-controller
+
+      - name: Download existing Helm repository
+        run: |
+          mkdir -p helm-repo
+          if curl -f -s https://castai.github.io/castai-pdb-controller/index.yaml -o existing-index.yaml; then
+            echo "Downloaded existing index.yaml"
+            chart_urls=$(grep -o 'https://castai.github.io/castai-pdb-controller/castai-pdb-controller-[^"]*\.tgz' existing-index.yaml || true)
+            if [ -n "$chart_urls" ]; then
+              echo "$chart_urls" | while read -r url; do
+                filename=$(basename "$url")
+                if curl -f -s "$url" -o "helm-repo/$filename"; then
+                  echo "Downloaded existing chart: $filename"
+                fi
+              done
+            fi
+          else
+            echo "No existing repository found, starting fresh"
+          fi
+
+      - name: Build Helm repository index
+        run: |
+          cp castai-pdb-controller-*.tgz helm-repo/
+          if [ -f existing-index.yaml ]; then
+            helm repo index helm-repo --url https://castai.github.io/castai-pdb-controller --merge existing-index.yaml
+          else
+            helm repo index helm-repo --url https://castai.github.io/castai-pdb-controller
+          fi
+
+      - name: Setup Pages
+        uses: actions/configure-pages@45bfe0192ca1faeb007ade9deae92b16b8254a0d # v6.0.0
+
+      - name: Upload artifact
+        uses: actions/upload-pages-artifact@fc324d3547104276b827a68afc52ff2a11cc49c9 # v5.0.0
+        with:
+          path: helm-repo
+
+      - name: Deploy to GitHub Pages
+        id: deployment
+        uses: actions/deploy-pages@cd2ce8fcbc39b97be8ca5fce6e763baed58fa128 # v5.0.0
