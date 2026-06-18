@@ -202,6 +202,15 @@ func unhealthyPodEvictionPoliciesEqual(a, b *policyv1.UnhealthyPodEvictionPolicy
 }
 
 // updateExistingPDB updates an existing castai PDB with new configuration
+// waitForPDBDeletion gives the API server a moment for an async PDB delete to
+// fully settle before a recreate with the same name. ctx-aware so shutdowns aren't blocked.
+func waitForPDBDeletion(ctx context.Context) {
+	select {
+	case <-ctx.Done():
+	case <-time.After(time.Second):
+	}
+}
+
 // pdbSpecNeedsUpdate checks if the new PDB spec differs from the existing one (MinAvailable, MaxUnavailable, UnhealthyPodEvictionPolicy).
 func pdbSpecNeedsUpdate(existing, desired *policyv1.PodDisruptionBudgetSpec) bool {
 	// Check MinAvailable
@@ -295,23 +304,32 @@ func updateExistingPDB(ctx context.Context, clientset *kubernetes.Clientset, exi
 	if existingPDB.Spec.Selector != nil && enrichedSelector != nil {
 		existingPDBSel, err := metav1.LabelSelectorAsSelector(existingPDB.Spec.Selector)
 		if err != nil {
-			logErrorf("Failed to parse existing PDB selector for %s/%s: %v, will delete and recreate\n", namespace, name, err)
-			// Delete and recreate if parsing fails
-			err := clientset.PolicyV1().PodDisruptionBudgets(namespace).Delete(ctx, existingPDB.Name, metav1.DeleteOptions{})
-			if err != nil {
-				logErrorf("Failed to delete malformed PDB %s/%s: %v\n", namespace, name, err)
+			logErrorf("Failed to parse existing PDB selector for %s/%s: %v, deleting to recreate\n", namespace, name, err)
+			delErr := clientset.PolicyV1().PodDisruptionBudgets(namespace).Delete(ctx, existingPDB.Name, metav1.DeleteOptions{})
+			if delErr != nil && !apierrors.IsNotFound(delErr) {
+				logErrorf("Failed to delete malformed PDB %s/%s: %v\n", namespace, name, delErr)
+				return
 			}
+			waitForPDBDeletion(ctx)
+			createPDBForWorkload(ctx, clientset, obj)
 			return
 		}
-		enrichedSel, _ := metav1.LabelSelectorAsSelector(enrichedSelector)
+		enrichedSel, err := metav1.LabelSelectorAsSelector(enrichedSelector)
+		if err != nil {
+			logErrorf("Failed to parse enriched selector for %s/%s: %v\n", namespace, name, err)
+			return
+		}
 		if existingPDBSel.String() != enrichedSel.String() {
-			// Selectors differ; delete and recreate
+			// Selectors differ; delete and recreate after a brief wait so the deletion
+			// has time to propagate before the recreate path runs.
 			err := clientset.PolicyV1().PodDisruptionBudgets(namespace).Delete(ctx, existingPDB.Name, metav1.DeleteOptions{})
-			if err != nil {
+			if err != nil && !apierrors.IsNotFound(err) {
 				logErrorf("Failed to delete PDB %s/%s for recreation: %v\n", namespace, name, err)
 				return
 			}
-			logInfof("Deleted PDB %s/%s due to selector change, will recreate\n", namespace, name)
+			logInfof("Deleted PDB %s/%s due to selector change, recreating\n", namespace, name)
+			waitForPDBDeletion(ctx)
+			createPDBForWorkload(ctx, clientset, obj)
 			return
 		}
 	}
@@ -1046,6 +1064,8 @@ func logAndFixPoorPDBConfig(
 			logErrorf("Failed to delete poor PDB %s/%s: %v\n", namespace, pdb.Name, err)
 			return
 		}
+		// Wait for the deletion to propagate before recreating to avoid an AlreadyExists race.
+		waitForPDBDeletion(ctx)
 		// Recreate PDB using the default creation flow for the workload
 		createPDBForWorkload(ctx, clientset, workloadObj)
 	}
@@ -1267,39 +1287,34 @@ func createPDBForWorkload(ctx context.Context, clientset *kubernetes.Clientset, 
 
 	if exists {
 		// PDB selectors are immutable; if the enriched selector differs from the existing one,
-		// we must delete the old PDB and fall through to create a new one.
+		// we must delete the old PDB before recreating. Kubernetes deletion is asynchronous,
+		// so we briefly wait for the delete to propagate before falling through to Create.
+		// If the wait is insufficient (rare), Create returns AlreadyExists and recreation is
+		// deferred to the next reconcile loop.
 		if existingPDB.Spec.Selector != nil {
 			existingSel, err := metav1.LabelSelectorAsSelector(existingPDB.Spec.Selector)
-			newSel, err2 := metav1.LabelSelectorAsSelector(pdbSpec.Selector)
-			if err == nil && err2 == nil && existingSel.String() != newSel.String() {
+			if err != nil {
+				logErrorf("Failed to parse existing PDB selector for %s/%s: %v\n", namespace, pdbName, err)
+				return
+			}
+			newSel, err := metav1.LabelSelectorAsSelector(pdbSpec.Selector)
+			if err != nil {
+				logErrorf("Failed to parse new PDB selector for %s/%s: %v\n", namespace, pdbName, err)
+				return
+			}
+			if existingSel.String() != newSel.String() {
 				logInfof("Selector changed for PDB %s/%s (was %q, now %q); deleting to recreate\n",
 					namespace, pdbName, existingSel.String(), newSel.String())
 				if delErr := clientset.PolicyV1().PodDisruptionBudgets(namespace).Delete(ctx, pdbName, metav1.DeleteOptions{}); delErr != nil && !apierrors.IsNotFound(delErr) {
 					logErrorf("Failed to delete PDB %s/%s for selector change: %v\n", namespace, pdbName, delErr)
 					return
 				}
+
+				// Brief wait for the deletion to propagate; ctx-aware so shutdowns aren't blocked.
+				waitForPDBDeletion(ctx)
 				// Fall through to the create block below
 			} else {
-				needsUpdate := false
-				if existingPDB.Spec.MinAvailable == nil && pdbSpec.MinAvailable != nil {
-					needsUpdate = true
-				} else if existingPDB.Spec.MinAvailable != nil && pdbSpec.MinAvailable == nil {
-					needsUpdate = true
-				} else if existingPDB.Spec.MinAvailable != nil && pdbSpec.MinAvailable != nil &&
-					existingPDB.Spec.MinAvailable.String() != pdbSpec.MinAvailable.String() {
-					needsUpdate = true
-				}
-				if existingPDB.Spec.MaxUnavailable == nil && pdbSpec.MaxUnavailable != nil {
-					needsUpdate = true
-				} else if existingPDB.Spec.MaxUnavailable != nil && pdbSpec.MaxUnavailable == nil {
-					needsUpdate = true
-				} else if existingPDB.Spec.MaxUnavailable != nil && pdbSpec.MaxUnavailable != nil &&
-					existingPDB.Spec.MaxUnavailable.String() != pdbSpec.MaxUnavailable.String() {
-					needsUpdate = true
-				}
-				if !unhealthyPodEvictionPoliciesEqual(existingPDB.Spec.UnhealthyPodEvictionPolicy, pdbSpec.UnhealthyPodEvictionPolicy) {
-					needsUpdate = true
-				}
+				needsUpdate := pdbSpecNeedsUpdate(&existingPDB.Spec, &pdbSpec)
 				if needsUpdate {
 					existingPDB.Spec = pdbSpec
 					_, err := clientset.PolicyV1().PodDisruptionBudgets(namespace).Update(ctx, existingPDB, metav1.UpdateOptions{})
@@ -1315,26 +1330,7 @@ func createPDBForWorkload(ctx context.Context, clientset *kubernetes.Clientset, 
 				return
 			}
 		} else {
-			needsUpdate := false
-			if existingPDB.Spec.MinAvailable == nil && pdbSpec.MinAvailable != nil {
-				needsUpdate = true
-			} else if existingPDB.Spec.MinAvailable != nil && pdbSpec.MinAvailable == nil {
-				needsUpdate = true
-			} else if existingPDB.Spec.MinAvailable != nil && pdbSpec.MinAvailable != nil &&
-				existingPDB.Spec.MinAvailable.String() != pdbSpec.MinAvailable.String() {
-				needsUpdate = true
-			}
-			if existingPDB.Spec.MaxUnavailable == nil && pdbSpec.MaxUnavailable != nil {
-				needsUpdate = true
-			} else if existingPDB.Spec.MaxUnavailable != nil && pdbSpec.MaxUnavailable == nil {
-				needsUpdate = true
-			} else if existingPDB.Spec.MaxUnavailable != nil && pdbSpec.MaxUnavailable != nil &&
-				existingPDB.Spec.MaxUnavailable.String() != pdbSpec.MaxUnavailable.String() {
-				needsUpdate = true
-			}
-			if !unhealthyPodEvictionPoliciesEqual(existingPDB.Spec.UnhealthyPodEvictionPolicy, pdbSpec.UnhealthyPodEvictionPolicy) {
-				needsUpdate = true
-			}
+			needsUpdate := pdbSpecNeedsUpdate(&existingPDB.Spec, &pdbSpec)
 			if needsUpdate {
 				existingPDB.Spec = pdbSpec
 				_, err := clientset.PolicyV1().PodDisruptionBudgets(namespace).Update(ctx, existingPDB, metav1.UpdateOptions{})
