@@ -201,12 +201,45 @@ func unhealthyPodEvictionPoliciesEqual(a, b *policyv1.UnhealthyPodEvictionPolicy
 	return *a == *b
 }
 
-// waitForPDBDeletion gives the API server a moment for an async PDB delete to
-// fully settle before a recreate with the same name. ctx-aware so shutdowns aren't blocked.
-func waitForPDBDeletion(ctx context.Context) {
-	select {
-	case <-ctx.Done():
-	case <-time.After(time.Second):
+const (
+	pdbDeletionPollInterval = 100 * time.Millisecond
+	pdbDeletionPollTimeout  = 5 * time.Second
+)
+
+// deleteCastaiPDBIfUnderReplicated removes the castai-managed PDB when a workload has
+// fewer than 2 replicas. Returns true when the caller should stop processing.
+func deleteCastaiPDBIfUnderReplicated(ctx context.Context, clientset kubernetes.Interface, namespace, workloadName string, replicas *int32) bool {
+	if replicas != nil && *replicas >= 2 {
+		return false
+	}
+	pdbName := fmt.Sprintf("castai-%s-pdb", workloadName)
+	logInfof("Workload %s/%s has fewer than 2 replicas; deleting PDB %s to prevent blocking disruptions\n", namespace, workloadName, pdbName)
+	err := clientset.PolicyV1().PodDisruptionBudgets(namespace).Delete(ctx, pdbName, metav1.DeleteOptions{})
+	if err != nil && !apierrors.IsNotFound(err) {
+		logErrorf("Failed to delete PDB %s/%s for scaled-down workload: %v\n", namespace, pdbName, err)
+	}
+	return true
+}
+
+// waitForPDBDeletion polls until the PDB is gone or a bounded timeout elapses.
+func waitForPDBDeletion(ctx context.Context, clientset kubernetes.Interface, namespace, name string) {
+	if clientset == nil {
+		return
+	}
+	deadline := time.Now().Add(pdbDeletionPollTimeout)
+	for {
+		_, err := clientset.PolicyV1().PodDisruptionBudgets(namespace).Get(ctx, name, metav1.GetOptions{})
+		if apierrors.IsNotFound(err) {
+			return
+		}
+		if time.Now().After(deadline) {
+			return
+		}
+		select {
+		case <-ctx.Done():
+			return
+		case <-time.After(pdbDeletionPollInterval):
+		}
 	}
 }
 
@@ -243,7 +276,11 @@ func pdbSpecNeedsUpdate(existing, desired *policyv1.PodDisruptionBudgetSpec) boo
 }
 
 // updateExistingPDB updates an existing castai PDB with new configuration
-func updateExistingPDB(ctx context.Context, clientset *kubernetes.Clientset, existingPDB *policyv1.PodDisruptionBudget, workloadAnnotations map[string]string, replicas *int32, namespace, name string, obj interface{}) {
+func updateExistingPDB(ctx context.Context, clientset kubernetes.Interface, existingPDB *policyv1.PodDisruptionBudget, workloadAnnotations map[string]string, replicas *int32, namespace, name string, obj interface{}) {
+	if deleteCastaiPDBIfUnderReplicated(ctx, clientset, namespace, name, replicas) {
+		return
+	}
+
 	// Parse PDB configuration from annotations or defaults
 	var minAvailable, maxUnavailable *intstr.IntOrString
 	var needsUpdate bool
@@ -310,7 +347,7 @@ func updateExistingPDB(ctx context.Context, clientset *kubernetes.Clientset, exi
 				logErrorf("Failed to delete malformed PDB %s/%s: %v\n", namespace, name, delErr)
 				return
 			}
-			waitForPDBDeletion(ctx)
+			waitForPDBDeletion(ctx, clientset, namespace, existingPDB.Name)
 			createPDBForWorkload(ctx, clientset, obj)
 			return
 		}
@@ -328,7 +365,7 @@ func updateExistingPDB(ctx context.Context, clientset *kubernetes.Clientset, exi
 				return
 			}
 			logInfof("Deleted PDB %s/%s due to selector change, recreating\n", namespace, name)
-			waitForPDBDeletion(ctx)
+			waitForPDBDeletion(ctx, clientset, namespace, existingPDB.Name)
 			createPDBForWorkload(ctx, clientset, obj)
 			return
 		}
@@ -995,7 +1032,7 @@ func parsePDBValue(input string) *intstr.IntOrString {
 // controls the poor PDB logging behavior, moves to createPDB function if configMap set to True
 func logAndFixPoorPDBConfig(
 	ctx context.Context,
-	clientset *kubernetes.Clientset,
+	clientset kubernetes.Interface,
 	pdb *policyv1.PodDisruptionBudget,
 	workloadName string,
 	replicas int32,
@@ -1065,14 +1102,14 @@ func logAndFixPoorPDBConfig(
 			return
 		}
 		// Wait for the deletion to propagate before recreating to avoid an AlreadyExists race.
-		waitForPDBDeletion(ctx)
+		waitForPDBDeletion(ctx, clientset, namespace, pdb.Name)
 		// Recreate PDB using the default creation flow for the workload
 		createPDBForWorkload(ctx, clientset, workloadObj)
 	}
 }
 
 // core create PDB workflow
-func createPDBForWorkload(ctx context.Context, clientset *kubernetes.Clientset, obj interface{}) {
+func createPDBForWorkload(ctx context.Context, clientset kubernetes.Interface, obj interface{}) {
 	logDebugf("createPDBForWorkload called for object type %T", obj)
 	var (
 		selector            *metav1.LabelSelector
@@ -1085,13 +1122,7 @@ func createPDBForWorkload(ctx context.Context, clientset *kubernetes.Clientset, 
 	switch workload := obj.(type) {
 	case *appsv1.Deployment:
 		replicas = workload.Spec.Replicas
-		if replicas == nil || *replicas < 2 {
-			pdbName := fmt.Sprintf("castai-%s-pdb", workload.Name)
-			logInfof("Workload %s/%s has fewer than 2 replicas; deleting PDB %s to prevent blocking disruptions\n", workload.Namespace, workload.Name, pdbName)
-			err := clientset.PolicyV1().PodDisruptionBudgets(workload.Namespace).Delete(ctx, pdbName, metav1.DeleteOptions{})
-			if err != nil && !apierrors.IsNotFound(err) {
-				logErrorf("Failed to delete PDB %s/%s for scaled-down workload: %v\n", workload.Namespace, pdbName, err)
-			}
+		if deleteCastaiPDBIfUnderReplicated(ctx, clientset, workload.Namespace, workload.Name, replicas) {
 			return
 		}
 		if workload.Annotations != nil {
@@ -1114,13 +1145,7 @@ func createPDBForWorkload(ctx context.Context, clientset *kubernetes.Clientset, 
 		logDebugf("Workload %s/%s is NOT excluded", namespace, name)
 	case *appsv1.StatefulSet:
 		replicas = workload.Spec.Replicas
-		if replicas == nil || *replicas < 2 {
-			pdbName := fmt.Sprintf("castai-%s-pdb", workload.Name)
-			logInfof("Workload %s/%s has fewer than 2 replicas; deleting PDB %s to prevent blocking disruptions\n", workload.Namespace, workload.Name, pdbName)
-			err := clientset.PolicyV1().PodDisruptionBudgets(workload.Namespace).Delete(ctx, pdbName, metav1.DeleteOptions{})
-			if err != nil && !apierrors.IsNotFound(err) {
-				logErrorf("Failed to delete PDB %s/%s for scaled-down workload: %v\n", workload.Namespace, pdbName, err)
-			}
+		if deleteCastaiPDBIfUnderReplicated(ctx, clientset, workload.Namespace, workload.Name, replicas) {
 			return
 		}
 		if workload.Annotations != nil {
@@ -1311,7 +1336,7 @@ func createPDBForWorkload(ctx context.Context, clientset *kubernetes.Clientset, 
 				}
 
 				// Brief wait for the deletion to propagate; ctx-aware so shutdowns aren't blocked.
-				waitForPDBDeletion(ctx)
+				waitForPDBDeletion(ctx, clientset, namespace, pdbName)
 				// Fall through to the create block below
 			} else {
 				needsUpdate := pdbSpecNeedsUpdate(&existingPDB.Spec, &pdbSpec)
@@ -1520,7 +1545,8 @@ func workloadHasExistingPDB(ctx context.Context, clientset *kubernetes.Clientset
 		return false
 	}
 
-	// Apply the same enrichment as createPDBForWorkload so selector comparison is consistent
+	// Enrich the workload selector the same way as createPDBForWorkload, then compare it
+	// against existing PDB selectors.
 	defaultPDBConfigLock.RLock()
 	additionalSelectorLabels := defaultPDBConfig.AdditionalSelectorLabels
 	defaultPDBConfigLock.RUnlock()

@@ -1,12 +1,17 @@
 package main
 
 import (
+	"context"
 	"testing"
 	"time"
 
+	appsv1 "k8s.io/api/apps/v1"
+	corev1 "k8s.io/api/core/v1"
 	policyv1 "k8s.io/api/policy/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/util/intstr"
+	"k8s.io/client-go/kubernetes/fake"
 )
 
 // Regression tests for core PDB controller behavior (values, annotations, exclusions, unhealthy policy resolution).
@@ -396,4 +401,130 @@ func TestAdditionalSelectorLabels_RealWorld(t *testing.T) {
 			t.Errorf("original deployment selector should be unchanged, got %v", got.MatchLabels)
 		}
 	})
+}
+
+func TestDeleteCastaiPDBIfUnderReplicated(t *testing.T) {
+	resetDefaultPDBConfig()
+	t.Cleanup(resetDefaultPDBConfig)
+
+	existingPDB := &policyv1.PodDisruptionBudget{
+		ObjectMeta: metav1.ObjectMeta{Name: "castai-myapp-pdb", Namespace: "default"},
+		Spec: policyv1.PodDisruptionBudgetSpec{
+			Selector:     &metav1.LabelSelector{MatchLabels: map[string]string{"app": "myapp"}},
+			MinAvailable: intstrPtr(intstr.FromInt32(1)),
+		},
+	}
+	clientset := fake.NewSimpleClientset(existingPDB)
+	ctx := context.Background()
+
+	two := int32(2)
+	if deleteCastaiPDBIfUnderReplicated(ctx, clientset, "default", "myapp", &two) {
+		t.Fatal("two replicas should not trigger deletion")
+	}
+	if _, err := clientset.PolicyV1().PodDisruptionBudgets("default").Get(ctx, "castai-myapp-pdb", metav1.GetOptions{}); err != nil {
+		t.Fatalf("PDB should still exist with 2 replicas: %v", err)
+	}
+
+	one := int32(1)
+	if !deleteCastaiPDBIfUnderReplicated(ctx, clientset, "default", "myapp", &one) {
+		t.Fatal("single replica should trigger deletion")
+	}
+	if _, err := clientset.PolicyV1().PodDisruptionBudgets("default").Get(ctx, "castai-myapp-pdb", metav1.GetOptions{}); !apierrors.IsNotFound(err) {
+		t.Fatalf("PDB should be deleted for single replica, got err=%v", err)
+	}
+}
+
+func TestWaitForPDBDeletion_returnsWhenPDBIsGone(t *testing.T) {
+	pdb := &policyv1.PodDisruptionBudget{
+		ObjectMeta: metav1.ObjectMeta{Name: "castai-wait-pdb", Namespace: "default"},
+		Spec: policyv1.PodDisruptionBudgetSpec{
+			Selector:     &metav1.LabelSelector{MatchLabels: map[string]string{"app": "wait"}},
+			MinAvailable: intstrPtr(intstr.FromInt32(1)),
+		},
+	}
+	clientset := fake.NewSimpleClientset(pdb)
+	ctx := context.Background()
+
+	if err := clientset.PolicyV1().PodDisruptionBudgets("default").Delete(ctx, "castai-wait-pdb", metav1.DeleteOptions{}); err != nil {
+		t.Fatalf("setup delete: %v", err)
+	}
+
+	start := time.Now()
+	waitForPDBDeletion(ctx, clientset, "default", "castai-wait-pdb")
+	if time.Since(start) > pdbDeletionPollTimeout {
+		t.Fatalf("waitForPDBDeletion took longer than timeout")
+	}
+}
+
+func TestUpdateExistingPDB_deletesWhenScaledBelowTwoReplicas(t *testing.T) {
+	resetDefaultPDBConfig()
+	t.Cleanup(resetDefaultPDBConfig)
+
+	one := int32(1)
+	existingPDB := &policyv1.PodDisruptionBudget{
+		ObjectMeta: metav1.ObjectMeta{Name: "castai-myapp-pdb", Namespace: "default"},
+		Spec: policyv1.PodDisruptionBudgetSpec{
+			Selector:     &metav1.LabelSelector{MatchLabels: map[string]string{"app": "myapp"}},
+			MinAvailable: intstrPtr(intstr.FromInt32(1)),
+		},
+	}
+	clientset := fake.NewSimpleClientset(existingPDB)
+	dep := &appsv1.Deployment{
+		ObjectMeta: metav1.ObjectMeta{Name: "myapp", Namespace: "default"},
+		Spec: appsv1.DeploymentSpec{
+			Replicas: &one,
+			Selector: &metav1.LabelSelector{MatchLabels: map[string]string{"app": "myapp"}},
+			Template: corev1.PodTemplateSpec{
+				ObjectMeta: metav1.ObjectMeta{Labels: map[string]string{"app": "myapp"}},
+			},
+		},
+	}
+
+	updateExistingPDB(context.Background(), clientset, existingPDB, nil, &one, "default", "myapp", dep)
+	if _, err := clientset.PolicyV1().PodDisruptionBudgets("default").Get(context.Background(), "castai-myapp-pdb", metav1.GetOptions{}); !apierrors.IsNotFound(err) {
+		t.Fatalf("expected PDB to be deleted on scale-down, got err=%v", err)
+	}
+}
+
+func TestUpdateExistingPDB_recreatesWhenSelectorChanges(t *testing.T) {
+	resetDefaultPDBConfig()
+	t.Cleanup(resetDefaultPDBConfig)
+
+	defaultPDBConfigLock.Lock()
+	defaultPDBConfig.AdditionalSelectorLabels = []string{"role"}
+	defaultPDBConfigLock.Unlock()
+
+	two := int32(2)
+	existingPDB := &policyv1.PodDisruptionBudget{
+		ObjectMeta: metav1.ObjectMeta{Name: "castai-myapp-pdb", Namespace: "default"},
+		Spec: policyv1.PodDisruptionBudgetSpec{
+			Selector:     &metav1.LabelSelector{MatchLabels: map[string]string{"app": "myapp"}},
+			MinAvailable: intstrPtr(intstr.FromInt32(1)),
+		},
+	}
+	clientset := fake.NewSimpleClientset(existingPDB)
+	dep := &appsv1.Deployment{
+		ObjectMeta: metav1.ObjectMeta{Name: "myapp", Namespace: "default"},
+		Spec: appsv1.DeploymentSpec{
+			Replicas: &two,
+			Selector: &metav1.LabelSelector{MatchLabels: map[string]string{"app": "myapp"}},
+			Template: corev1.PodTemplateSpec{
+				ObjectMeta: metav1.ObjectMeta{Labels: map[string]string{"app": "myapp", "role": "worker"}},
+			},
+		},
+	}
+
+	updateExistingPDB(context.Background(), clientset, existingPDB, nil, &two, "default", "myapp", dep)
+
+	got, err := clientset.PolicyV1().PodDisruptionBudgets("default").Get(context.Background(), "castai-myapp-pdb", metav1.GetOptions{})
+	if err != nil {
+		t.Fatalf("expected recreated PDB, got err=%v", err)
+	}
+	if got.Spec.Selector == nil || got.Spec.Selector.MatchLabels["role"] != "worker" {
+		t.Fatalf("expected enriched selector with role=worker, got %#v", got.Spec.Selector)
+	}
+}
+
+func intstrPtr(v intstr.IntOrString) *intstr.IntOrString {
+	return &v
 }
