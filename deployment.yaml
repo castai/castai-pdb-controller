@@ -8,6 +8,7 @@ spec:
   selector:
     matchLabels:
       app: castai-pdb-controller
+      just-some-weird-stuff: here
   template:
     metadata:
       labels:
