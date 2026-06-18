@@ -201,7 +201,6 @@ func unhealthyPodEvictionPoliciesEqual(a, b *policyv1.UnhealthyPodEvictionPolicy
 	return *a == *b
 }
 
-// updateExistingPDB updates an existing castai PDB with new configuration
 // waitForPDBDeletion gives the API server a moment for an async PDB delete to
 // fully settle before a recreate with the same name. ctx-aware so shutdowns aren't blocked.
 func waitForPDBDeletion(ctx context.Context) {
@@ -243,6 +242,7 @@ func pdbSpecNeedsUpdate(existing, desired *policyv1.PodDisruptionBudgetSpec) boo
 	return false
 }
 
+// updateExistingPDB updates an existing castai PDB with new configuration
 func updateExistingPDB(ctx context.Context, clientset *kubernetes.Clientset, existingPDB *policyv1.PodDisruptionBudget, workloadAnnotations map[string]string, replicas *int32, namespace, name string, obj interface{}) {
 	// Parse PDB configuration from annotations or defaults
 	var minAvailable, maxUnavailable *intstr.IntOrString
