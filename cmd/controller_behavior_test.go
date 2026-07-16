@@ -525,6 +525,152 @@ func TestUpdateExistingPDB_recreatesWhenSelectorChanges(t *testing.T) {
 	}
 }
 
+func TestCreatePDBForWorkload_skipsWhenExistingPDBSelectorIsSupersetMatch(t *testing.T) {
+	resetDefaultPDBConfig()
+	t.Cleanup(resetDefaultPDBConfig)
+
+	// Pre-existing (e.g. Helm-managed) PDB whose selector has an extra "shard"
+	// key beyond what the workload's own Spec.Selector uses. Its selector
+	// string will never equal the workload's computed selector string, but it
+	// still matches every pod produced by the workload's template labels.
+	preExistingPDB := &policyv1.PodDisruptionBudget{
+		ObjectMeta: metav1.ObjectMeta{Name: "my-helm-managed-pdb", Namespace: "default"},
+		Spec: policyv1.PodDisruptionBudgetSpec{
+			Selector: &metav1.LabelSelector{
+				MatchLabels: map[string]string{"app": "clickhouse", "shard": "0"},
+			},
+			MinAvailable: intstrPtr(intstr.FromInt32(1)),
+		},
+	}
+	clientset := fake.NewSimpleClientset(preExistingPDB)
+
+	two := int32(2)
+	sts := &appsv1.StatefulSet{
+		ObjectMeta: metav1.ObjectMeta{Name: "clickhouse-shard0", Namespace: "default"},
+		Spec: appsv1.StatefulSetSpec{
+			Replicas: &two,
+			Selector: &metav1.LabelSelector{MatchLabels: map[string]string{"app": "clickhouse"}},
+			Template: corev1.PodTemplateSpec{
+				ObjectMeta: metav1.ObjectMeta{Labels: map[string]string{"app": "clickhouse", "shard": "0"}},
+			},
+		},
+	}
+
+	createPDBForWorkload(context.Background(), clientset, sts)
+
+	pdbs, err := clientset.PolicyV1().PodDisruptionBudgets("default").List(context.Background(), metav1.ListOptions{})
+	if err != nil {
+		t.Fatalf("failed to list PDBs: %v", err)
+	}
+	if len(pdbs.Items) != 1 {
+		t.Fatalf("expected no new PDB to be created, got %d PDBs: %#v", len(pdbs.Items), pdbs.Items)
+	}
+	if pdbs.Items[0].Name != "my-helm-managed-pdb" {
+		t.Fatalf("expected only the pre-existing PDB to remain, got %s", pdbs.Items[0].Name)
+	}
+}
+
+func TestGarbageCollectOrphanedPDBs_deletesWhenWorkloadGone(t *testing.T) {
+	pdb := &policyv1.PodDisruptionBudget{
+		ObjectMeta: metav1.ObjectMeta{Name: "castai-gone-pdb", Namespace: "default"},
+		Spec: policyv1.PodDisruptionBudgetSpec{
+			Selector:     &metav1.LabelSelector{MatchLabels: map[string]string{"app": "gone"}},
+			MinAvailable: intstrPtr(intstr.FromInt32(1)),
+		},
+	}
+	clientset := fake.NewSimpleClientset(pdb)
+
+	garbageCollectOrphanedPDBs(context.Background(), clientset)
+
+	if _, err := clientset.PolicyV1().PodDisruptionBudgets("default").Get(context.Background(), "castai-gone-pdb", metav1.GetOptions{}); !apierrors.IsNotFound(err) {
+		t.Fatalf("expected orphaned PDB to be deleted, got err=%v", err)
+	}
+}
+
+func TestGarbageCollectOrphanedPDBs_deletesWhenWorkloadUnderReplicated(t *testing.T) {
+	one := int32(1)
+	pdb := &policyv1.PodDisruptionBudget{
+		ObjectMeta: metav1.ObjectMeta{Name: "castai-myapp-pdb", Namespace: "default"},
+		Spec: policyv1.PodDisruptionBudgetSpec{
+			Selector:     &metav1.LabelSelector{MatchLabels: map[string]string{"app": "myapp"}},
+			MinAvailable: intstrPtr(intstr.FromInt32(1)),
+		},
+	}
+	dep := &appsv1.Deployment{
+		ObjectMeta: metav1.ObjectMeta{Name: "myapp", Namespace: "default"},
+		Spec: appsv1.DeploymentSpec{
+			Replicas: &one,
+			Selector: &metav1.LabelSelector{MatchLabels: map[string]string{"app": "myapp"}},
+			Template: corev1.PodTemplateSpec{
+				ObjectMeta: metav1.ObjectMeta{Labels: map[string]string{"app": "myapp"}},
+			},
+		},
+	}
+	clientset := fake.NewSimpleClientset(pdb, dep)
+
+	garbageCollectOrphanedPDBs(context.Background(), clientset)
+
+	if _, err := clientset.PolicyV1().PodDisruptionBudgets("default").Get(context.Background(), "castai-myapp-pdb", metav1.GetOptions{}); !apierrors.IsNotFound(err) {
+		t.Fatalf("expected under-replicated PDB to be deleted, got err=%v", err)
+	}
+}
+
+func TestGarbageCollectOrphanedPDBs_keepsPDBWhenWorkloadHasEnoughReplicas(t *testing.T) {
+	two := int32(2)
+	pdb := &policyv1.PodDisruptionBudget{
+		ObjectMeta: metav1.ObjectMeta{Name: "castai-myapp-pdb", Namespace: "default"},
+		Spec: policyv1.PodDisruptionBudgetSpec{
+			Selector:     &metav1.LabelSelector{MatchLabels: map[string]string{"app": "myapp"}},
+			MinAvailable: intstrPtr(intstr.FromInt32(1)),
+		},
+	}
+	dep := &appsv1.Deployment{
+		ObjectMeta: metav1.ObjectMeta{Name: "myapp", Namespace: "default"},
+		Spec: appsv1.DeploymentSpec{
+			Replicas: &two,
+			Selector: &metav1.LabelSelector{MatchLabels: map[string]string{"app": "myapp"}},
+			Template: corev1.PodTemplateSpec{
+				ObjectMeta: metav1.ObjectMeta{Labels: map[string]string{"app": "myapp"}},
+			},
+		},
+	}
+	clientset := fake.NewSimpleClientset(pdb, dep)
+
+	garbageCollectOrphanedPDBs(context.Background(), clientset)
+
+	if _, err := clientset.PolicyV1().PodDisruptionBudgets("default").Get(context.Background(), "castai-myapp-pdb", metav1.GetOptions{}); err != nil {
+		t.Fatalf("expected PDB to be kept for workload with 2 replicas, got err=%v", err)
+	}
+}
+
+func TestGarbageCollectOrphanedPDBs_deletesWhenStatefulSetUnderReplicated(t *testing.T) {
+	one := int32(1)
+	pdb := &policyv1.PodDisruptionBudget{
+		ObjectMeta: metav1.ObjectMeta{Name: "castai-mysts-pdb", Namespace: "default"},
+		Spec: policyv1.PodDisruptionBudgetSpec{
+			Selector:     &metav1.LabelSelector{MatchLabels: map[string]string{"app": "mysts"}},
+			MinAvailable: intstrPtr(intstr.FromInt32(1)),
+		},
+	}
+	sts := &appsv1.StatefulSet{
+		ObjectMeta: metav1.ObjectMeta{Name: "mysts", Namespace: "default"},
+		Spec: appsv1.StatefulSetSpec{
+			Replicas: &one,
+			Selector: &metav1.LabelSelector{MatchLabels: map[string]string{"app": "mysts"}},
+			Template: corev1.PodTemplateSpec{
+				ObjectMeta: metav1.ObjectMeta{Labels: map[string]string{"app": "mysts"}},
+			},
+		},
+	}
+	clientset := fake.NewSimpleClientset(pdb, sts)
+
+	garbageCollectOrphanedPDBs(context.Background(), clientset)
+
+	if _, err := clientset.PolicyV1().PodDisruptionBudgets("default").Get(context.Background(), "castai-mysts-pdb", metav1.GetOptions{}); !apierrors.IsNotFound(err) {
+		t.Fatalf("expected under-replicated StatefulSet PDB to be deleted, got err=%v", err)
+	}
+}
+
 func intstrPtr(v intstr.IntOrString) *intstr.IntOrString {
 	return &v
 }

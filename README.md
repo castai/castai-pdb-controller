@@ -31,13 +31,16 @@ This controller enables safe, automated disruption management with per-workload 
   Configure regex-based exclusion rules to automatically skip PDB creation for specific workloads based on namespace, name, and label patterns. Useful for system workloads, temporary deployments, or critical services.
 
 - **Garbage Collection:**  
-  Orphaned PDBs are cleaned up when workloads are deleted or change state.
+  Orphaned PDBs are cleaned up when workloads are deleted. PDBs are also cleaned up when their workload still exists but has scaled down to fewer than 2 replicas — this runs periodically as a safety net in case a live scale-down event was ever missed (e.g. due to a controller restart or leader-election gap), preventing a stale PDB from blocking node drains/rotations indefinitely.
 
 - **Leader Election:**  
   Supports safe, highly available operation in multi-replica controller deployments.
 
 - **Additional PDB Selector Labels:**  
   Optionally extend PDB `matchLabels` with extra labels drawn from each workload's pod template. Configure a list of label keys in the ConfigMap and the controller will add them to the PDB selector when they are present on the pod template — silently skipping any keys that are absent.
+
+- **Coverage-Based Existing-PDB Detection:**  
+  The controller recognizes a pre-existing PDB as already covering a workload whenever that PDB's selector matches the workload's pod template labels, even if the PDB's selector isn't written identically to the one the controller would generate. This avoids duplicate PDBs for workloads whose Helm chart (or other owner) manages a PDB with a differently-shaped but still-matching selector. When a match is found via a non-identical selector, the controller logs a `warn`-level message so operators can spot selectors that may need a disambiguating label.
 
 - **Configurable log levels:**  
   Set `logLevel` in the `castai-pdb-controller-config` ConfigMap to `debug`, `info`, `warn`, or `error` (default `info`) to control how much the controller writes to stderr.
@@ -221,6 +224,8 @@ spec:
 
 - **On workload creation or update:**  
   The controller checks for annotations and creates/updates a PDB accordingly.
+- **Detecting an already-covered workload:**  
+  Before creating a PDB, the controller checks whether any existing PDB in the namespace already covers the workload's pods — a PDB "covers" a workload if the PDB's selector matches the workload's pod template labels, not only when the selector is written identically to the one the controller would generate. This means a pre-existing, e.g. Helm-managed, PDB with extra selector labels (such as a `shard` key added to disambiguate sibling StatefulSets) is correctly recognized instead of triggering a duplicate `castai-*` PDB.
 - **On annotation or ConfigMap change:**  
   The controller reconciles and updates existing PDBs to match new settings.
 - **On workload deletion or bypass:**  
