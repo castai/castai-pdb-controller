@@ -1624,7 +1624,10 @@ func workloadHasExistingPDB(ctx context.Context, clientset kubernetes.Interface,
 	// Check for existing PDBs that cover this workload's pods
 	pdbList, err := clientset.PolicyV1().PodDisruptionBudgets(namespace).List(ctx, metav1.ListOptions{})
 	if err != nil {
-		return false
+		// Fail closed: treat as "already covered" so a transient list error does not
+		// cause createPDBForWorkload to invent a conflicting/duplicate PDB.
+		logWarnf("Reconciliation: failed to list PDBs for workload %s/%s: %v; skipping creation", namespace, name, err)
+		return true
 	}
 
 	for _, pdb := range pdbList.Items {

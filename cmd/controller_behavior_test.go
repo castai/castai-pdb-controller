@@ -705,6 +705,47 @@ func TestGarbageCollectOrphanedPDBs_keepsPDBOnTransientGetError(t *testing.T) {
 	}
 }
 
+func TestGarbageCollectOrphanedPDBs_keepsNonCastaiPDB(t *testing.T) {
+	// Helm-managed PDB with no matching Deployment/StatefulSet name derived from
+	// castai naming. GC must leave it alone (ownership guard: castai-*-pdb only).
+	helmPDB := &policyv1.PodDisruptionBudget{
+		ObjectMeta: metav1.ObjectMeta{Name: "my-helm-pdb", Namespace: "default"},
+		Spec: policyv1.PodDisruptionBudgetSpec{
+			Selector:     &metav1.LabelSelector{MatchLabels: map[string]string{"app": "clickhouse", "shard": "0"}},
+			MinAvailable: intstrPtr(intstr.FromInt32(1)),
+		},
+	}
+	clientset := fake.NewSimpleClientset(helmPDB)
+
+	garbageCollectOrphanedPDBs(context.Background(), clientset)
+
+	if _, err := clientset.PolicyV1().PodDisruptionBudgets("default").Get(context.Background(), "my-helm-pdb", metav1.GetOptions{}); err != nil {
+		t.Fatalf("expected non-castai/Helm PDB to be preserved, got err=%v", err)
+	}
+}
+
+func TestWorkloadHasExistingPDB_listErrorSkipsCreation(t *testing.T) {
+	two := int32(2)
+	dep := &appsv1.Deployment{
+		ObjectMeta: metav1.ObjectMeta{Name: "myapp", Namespace: "default"},
+		Spec: appsv1.DeploymentSpec{
+			Replicas: &two,
+			Selector: &metav1.LabelSelector{MatchLabels: map[string]string{"app": "myapp"}},
+			Template: corev1.PodTemplateSpec{
+				ObjectMeta: metav1.ObjectMeta{Labels: map[string]string{"app": "myapp"}},
+			},
+		},
+	}
+	clientset := fake.NewSimpleClientset(dep)
+	clientset.PrependReactor("list", "poddisruptionbudgets", func(action clienttesting.Action) (bool, runtime.Object, error) {
+		return true, nil, fmt.Errorf("apiserver timeout")
+	})
+
+	if !workloadHasExistingPDB(context.Background(), clientset, dep) {
+		t.Fatal("expected list failure to return true (skip creation), got false")
+	}
+}
+
 func TestCreatePDBForWorkload_createsWhenExistingPDBDoesNotCoverPods(t *testing.T) {
 	resetDefaultPDBConfig()
 	t.Cleanup(resetDefaultPDBConfig)
