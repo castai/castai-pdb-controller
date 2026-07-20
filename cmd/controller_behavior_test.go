@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"fmt"
 	"testing"
 	"time"
 
@@ -10,8 +11,10 @@ import (
 	policyv1 "k8s.io/api/policy/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/util/intstr"
 	"k8s.io/client-go/kubernetes/fake"
+	clienttesting "k8s.io/client-go/testing"
 )
 
 // Regression tests for core PDB controller behavior (values, annotations, exclusions, unhealthy policy resolution).
@@ -668,6 +671,73 @@ func TestGarbageCollectOrphanedPDBs_deletesWhenStatefulSetUnderReplicated(t *tes
 
 	if _, err := clientset.PolicyV1().PodDisruptionBudgets("default").Get(context.Background(), "castai-mysts-pdb", metav1.GetOptions{}); !apierrors.IsNotFound(err) {
 		t.Fatalf("expected under-replicated StatefulSet PDB to be deleted, got err=%v", err)
+	}
+}
+
+func TestGarbageCollectOrphanedPDBs_keepsPDBOnTransientGetError(t *testing.T) {
+	two := int32(2)
+	pdb := &policyv1.PodDisruptionBudget{
+		ObjectMeta: metav1.ObjectMeta{Name: "castai-myapp-pdb", Namespace: "default"},
+		Spec: policyv1.PodDisruptionBudgetSpec{
+			Selector:     &metav1.LabelSelector{MatchLabels: map[string]string{"app": "myapp"}},
+			MinAvailable: intstrPtr(intstr.FromInt32(1)),
+		},
+	}
+	dep := &appsv1.Deployment{
+		ObjectMeta: metav1.ObjectMeta{Name: "myapp", Namespace: "default"},
+		Spec: appsv1.DeploymentSpec{
+			Replicas: &two,
+			Selector: &metav1.LabelSelector{MatchLabels: map[string]string{"app": "myapp"}},
+			Template: corev1.PodTemplateSpec{
+				ObjectMeta: metav1.ObjectMeta{Labels: map[string]string{"app": "myapp"}},
+			},
+		},
+	}
+	clientset := fake.NewSimpleClientset(pdb, dep)
+	clientset.PrependReactor("get", "deployments", func(action clienttesting.Action) (bool, runtime.Object, error) {
+		return true, nil, fmt.Errorf("apiserver timeout")
+	})
+
+	garbageCollectOrphanedPDBs(context.Background(), clientset)
+
+	if _, err := clientset.PolicyV1().PodDisruptionBudgets("default").Get(context.Background(), "castai-myapp-pdb", metav1.GetOptions{}); err != nil {
+		t.Fatalf("expected PDB to be kept when Deployment Get fails transiently, got err=%v", err)
+	}
+}
+
+func TestCreatePDBForWorkload_createsWhenExistingPDBDoesNotCoverPods(t *testing.T) {
+	resetDefaultPDBConfig()
+	t.Cleanup(resetDefaultPDBConfig)
+
+	// Helm PDB selector requires env=prod, but the workload pods only have app=myapp.
+	// Coverage check must fail and a castai PDB should still be created.
+	preExistingPDB := &policyv1.PodDisruptionBudget{
+		ObjectMeta: metav1.ObjectMeta{Name: "unrelated-helm-pdb", Namespace: "default"},
+		Spec: policyv1.PodDisruptionBudgetSpec{
+			Selector: &metav1.LabelSelector{
+				MatchLabels: map[string]string{"app": "myapp", "env": "prod"},
+			},
+			MinAvailable: intstrPtr(intstr.FromInt32(1)),
+		},
+	}
+	clientset := fake.NewSimpleClientset(preExistingPDB)
+
+	two := int32(2)
+	dep := &appsv1.Deployment{
+		ObjectMeta: metav1.ObjectMeta{Name: "myapp", Namespace: "default"},
+		Spec: appsv1.DeploymentSpec{
+			Replicas: &two,
+			Selector: &metav1.LabelSelector{MatchLabels: map[string]string{"app": "myapp"}},
+			Template: corev1.PodTemplateSpec{
+				ObjectMeta: metav1.ObjectMeta{Labels: map[string]string{"app": "myapp"}},
+			},
+		},
+	}
+
+	createPDBForWorkload(context.Background(), clientset, dep)
+
+	if _, err := clientset.PolicyV1().PodDisruptionBudgets("default").Get(context.Background(), "castai-myapp-pdb", metav1.GetOptions{}); err != nil {
+		t.Fatalf("expected castai PDB to be created when pre-existing PDB does not cover pods, got err=%v", err)
 	}
 }
 

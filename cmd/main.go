@@ -1208,8 +1208,10 @@ func createPDBForWorkload(ctx context.Context, clientset kubernetes.Interface, o
 	// that one label set is equivalent to checking every live pod.
 	var existingCastaiPDB *policyv1.PodDisruptionBudget
 	var existingNonCastaiPDB *policyv1.PodDisruptionBudget
+	var existingCastaiExact bool
 
-	for _, pdb := range pdbList.Items {
+	for i := range pdbList.Items {
+		pdb := &pdbList.Items[i]
 		if pdb.Spec.Selector == nil {
 			continue
 		}
@@ -1217,20 +1219,31 @@ func createPDBForWorkload(ctx context.Context, clientset kubernetes.Interface, o
 		if err != nil || !pdbSel.Matches(labels.Set(podTemplateLabels)) {
 			continue
 		}
+		exact := pdbSel.String() == workloadSel.String()
 		// A match via non-identical selectors means this PDB's selector is a
 		// superset (or otherwise differently-shaped) match rather than an exact
 		// one. This is expected for e.g. Helm-managed PDBs, but is also the
 		// pattern that can cause an accidental cross-workload match if two
 		// sibling workloads share labels without a disambiguating key. Log it
 		// so operators have visibility into non-exact matches.
-		if pdbSel.String() != workloadSel.String() {
+		if !exact {
 			logWarnf("PDB %s/%s covers workload %s/%s via a non-identical selector (PDB selector: %q, workload selector: %q)\n",
 				namespace, pdb.Name, namespace, name, pdbSel.String(), workloadSel.String())
 		}
 		if strings.HasPrefix(pdb.Name, "castai-") {
-			existingCastaiPDB = &pdb
-		} else {
-			existingNonCastaiPDB = &pdb
+			// Prefer the first match; upgrade to an exact-match castai PDB if we
+			// later find one (deterministic vs last-list-item-wins).
+			if existingCastaiPDB == nil || (exact && !existingCastaiExact) {
+				existingCastaiPDB = pdb
+				existingCastaiExact = exact
+			}
+		} else if existingNonCastaiPDB == nil {
+			// First covering non-castai PDB wins (skip-create path).
+			existingNonCastaiPDB = pdb
+		}
+		// Non-castai coverage short-circuits creation; no need to keep scanning.
+		if existingNonCastaiPDB != nil {
+			break
 		}
 	}
 
@@ -1466,6 +1479,17 @@ func garbageCollectOrphanedPDBs(ctx context.Context, clientset kubernetes.Interf
 		deploy, errDep := clientset.AppsV1().Deployments(pdb.Namespace).Get(ctx, workloadName, metav1.GetOptions{})
 		sts, errSts := clientset.AppsV1().StatefulSets(pdb.Namespace).Get(ctx, workloadName, metav1.GetOptions{})
 
+		// Transient API errors (timeout, RBAC, etc.) must not be treated as
+		// "under-replicated" — that would delete PDBs that should be kept.
+		if errDep != nil && !apierrors.IsNotFound(errDep) {
+			logErrorf("Failed to get Deployment %s/%s while GC'ing PDB %s: %v", pdb.Namespace, workloadName, pdb.Name, errDep)
+			continue
+		}
+		if errSts != nil && !apierrors.IsNotFound(errSts) {
+			logErrorf("Failed to get StatefulSet %s/%s while GC'ing PDB %s: %v", pdb.Namespace, workloadName, pdb.Name, errSts)
+			continue
+		}
+
 		if apierrors.IsNotFound(errDep) && apierrors.IsNotFound(errSts) {
 			err := clientset.PolicyV1().PodDisruptionBudgets(pdb.Namespace).Delete(ctx, pdb.Name, metav1.DeleteOptions{})
 			if err != nil {
@@ -1485,7 +1509,7 @@ func garbageCollectOrphanedPDBs(ctx context.Context, clientset kubernetes.Interf
 		var replicas *int32
 		if errDep == nil {
 			replicas = deploy.Spec.Replicas
-		} else if errSts == nil {
+		} else {
 			replicas = sts.Spec.Replicas
 		}
 		if replicas == nil || *replicas < 2 {
@@ -1557,7 +1581,7 @@ func reconcileAllDefaultPDBs(ctx context.Context, clientset *kubernetes.Clientse
 }
 
 // workloadHasExistingPDB checks if a workload already has an existing PDB
-func workloadHasExistingPDB(ctx context.Context, clientset *kubernetes.Clientset, obj interface{}) bool {
+func workloadHasExistingPDB(ctx context.Context, clientset kubernetes.Interface, obj interface{}) bool {
 	var selector *metav1.LabelSelector
 	var namespace, name string
 	var workloadLabels map[string]string
@@ -1592,19 +1616,12 @@ func workloadHasExistingPDB(ctx context.Context, clientset *kubernetes.Clientset
 		return false
 	}
 
-	// Enrich the workload selector the same way as createPDBForWorkload, then compare it
-	// against existing PDB selectors.
-	defaultPDBConfigLock.RLock()
-	additionalSelectorLabels := defaultPDBConfig.AdditionalSelectorLabels
-	defaultPDBConfigLock.RUnlock()
-	selector = enrichSelectorWithAdditionalLabels(selector, podTemplateLabels, additionalSelectorLabels)
-
-	_, err := metav1.LabelSelectorAsSelector(selector)
-	if err != nil {
+	// Validate the workload selector; coverage is checked against pod template labels below.
+	if _, err := metav1.LabelSelectorAsSelector(selector); err != nil {
 		return false
 	}
 
-	// Check for existing PDBs that match this workload's selector
+	// Check for existing PDBs that cover this workload's pods
 	pdbList, err := clientset.PolicyV1().PodDisruptionBudgets(namespace).List(ctx, metav1.ListOptions{})
 	if err != nil {
 		return false
