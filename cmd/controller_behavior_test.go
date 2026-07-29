@@ -573,6 +573,62 @@ func TestCreatePDBForWorkload_skipsWhenExistingPDBSelectorIsSupersetMatch(t *tes
 	}
 }
 
+func TestCreatePDBForWorkload_treatsHelmPDBNamedLikeCastaiAsNonCastai(t *testing.T) {
+	resetDefaultPDBConfig()
+	t.Cleanup(resetDefaultPDBConfig)
+
+	// Helm-managed PDBs for castai's own components (e.g. castai-agent,
+	// castai-cluster-controller, castai-pod-mutator) are named after their
+	// Helm release, so they start with "castai-" but do not end in "-pdb"
+	// (unlike controller-generated PDBs, which are always named
+	// "castai-<workload>-pdb"). A prefix-only check misclassifies these as
+	// controller-owned, causing the controller to overwrite their spec
+	// instead of leaving them alone.
+	preExistingPDB := &policyv1.PodDisruptionBudget{
+		ObjectMeta: metav1.ObjectMeta{Name: "castai-cluster-controller", Namespace: "castai-agent"},
+		Spec: policyv1.PodDisruptionBudgetSpec{
+			// Missing app.kubernetes.io/instance, matching the real
+			// Helm chart selector gap: a coverage (non-exact) match.
+			Selector:       &metav1.LabelSelector{MatchLabels: map[string]string{"app.kubernetes.io/name": "castai-cluster-controller"}},
+			MaxUnavailable: intstrPtr(intstr.FromInt32(1)),
+		},
+	}
+	clientset := fake.NewSimpleClientset(preExistingPDB)
+
+	two := int32(2)
+	deploy := &appsv1.Deployment{
+		ObjectMeta: metav1.ObjectMeta{Name: "castai-cluster-controller", Namespace: "castai-agent"},
+		Spec: appsv1.DeploymentSpec{
+			Replicas: &two,
+			Selector: &metav1.LabelSelector{MatchLabels: map[string]string{"app.kubernetes.io/name": "castai-cluster-controller"}},
+			Template: corev1.PodTemplateSpec{
+				ObjectMeta: metav1.ObjectMeta{Labels: map[string]string{
+					"app.kubernetes.io/name":     "castai-cluster-controller",
+					"app.kubernetes.io/instance": "cluster-controller",
+				}},
+			},
+		},
+	}
+
+	createPDBForWorkload(context.Background(), clientset, deploy)
+
+	pdbs, err := clientset.PolicyV1().PodDisruptionBudgets("castai-agent").List(context.Background(), metav1.ListOptions{})
+	if err != nil {
+		t.Fatalf("failed to list PDBs: %v", err)
+	}
+	if len(pdbs.Items) != 1 {
+		t.Fatalf("expected no new PDB to be created, got %d PDBs: %#v", len(pdbs.Items), pdbs.Items)
+	}
+	got := pdbs.Items[0]
+	if got.Name != "castai-cluster-controller" {
+		t.Fatalf("expected only the pre-existing Helm PDB to remain, got %s", got.Name)
+	}
+	if got.Spec.MaxUnavailable == nil || got.Spec.MinAvailable != nil {
+		t.Fatalf("expected the Helm PDB's spec (MaxUnavailable) to be left untouched, got MinAvailable=%v MaxUnavailable=%v",
+			got.Spec.MinAvailable, got.Spec.MaxUnavailable)
+	}
+}
+
 func TestGarbageCollectOrphanedPDBs_deletesWhenWorkloadGone(t *testing.T) {
 	pdb := &policyv1.PodDisruptionBudget{
 		ObjectMeta: metav1.ObjectMeta{Name: "castai-gone-pdb", Namespace: "default"},
