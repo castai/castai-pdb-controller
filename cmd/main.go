@@ -1230,7 +1230,7 @@ func createPDBForWorkload(ctx context.Context, clientset kubernetes.Interface, o
 			logWarnf("PDB %s/%s covers workload %s/%s via a non-identical selector (PDB selector: %q, workload selector: %q)\n",
 				namespace, pdb.Name, namespace, name, pdbSel.String(), workloadSel.String())
 		}
-		if strings.HasPrefix(pdb.Name, "castai-") {
+		if strings.HasPrefix(pdb.Name, "castai-") && strings.HasSuffix(pdb.Name, "-pdb") {
 			// Prefer the first match; upgrade to an exact-match castai PDB if we
 			// later find one (deterministic vs last-list-item-wins).
 			if existingCastaiPDB == nil || (exact && !existingCastaiExact) {

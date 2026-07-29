@@ -42,6 +42,9 @@ This controller enables safe, automated disruption management with per-workload 
 - **Coverage-Based Existing-PDB Detection:**  
   The controller recognizes a pre-existing PDB as already covering a workload whenever that PDB's selector matches the workload's pod template labels, even if the PDB's selector isn't written identically to the one the controller would generate. This avoids duplicate PDBs for workloads whose Helm chart (or other owner) manages a PDB with a differently-shaped but still-matching selector. When a match is found via a non-identical selector, the controller logs a `warn`-level message so operators can spot selectors that may need a disambiguating label.
 
+- **Controller-Owned PDB Naming Convention:**  
+  The controller only treats a matching PDB as its own (safe to update to match its own config) when the PDB's name both starts with `castai-` **and** ends with `-pdb` — the exact pattern it uses when generating PDBs (`castai-<workload>-pdb`). Any other matching PDB, including ones from Helm charts whose release name happens to start with `castai-` (e.g. `castai-agent`, `castai-cluster-controller`, `castai-pod-mutator`), is treated as externally managed: the controller leaves it untouched and skips creating its own.
+
 - **Configurable log levels:**  
   Set `logLevel` in the `castai-pdb-controller-config` ConfigMap to `debug`, `info`, `warn`, or `error` (default `info`) to control how much the controller writes to stderr.
 
