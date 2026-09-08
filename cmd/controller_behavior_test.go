@@ -629,6 +629,173 @@ func TestCreatePDBForWorkload_treatsHelmPDBNamedLikeCastaiAsNonCastai(t *testing
 	}
 }
 
+func TestCreatePDBForWorkload_deletesLeftoverControllerPDBWhenCastaiHelmCovers(t *testing.T) {
+	resetDefaultPDBConfig()
+	t.Cleanup(resetDefaultPDBConfig)
+
+	helmPDB := &policyv1.PodDisruptionBudget{
+		ObjectMeta: metav1.ObjectMeta{Name: "castai-cluster-controller", Namespace: "castai-agent"},
+		Spec: policyv1.PodDisruptionBudgetSpec{
+			Selector:       &metav1.LabelSelector{MatchLabels: map[string]string{"app.kubernetes.io/name": "castai-cluster-controller"}},
+			MaxUnavailable: intstrPtr(intstr.FromInt32(1)),
+		},
+	}
+	leftover := &policyv1.PodDisruptionBudget{
+		ObjectMeta: metav1.ObjectMeta{Name: "castai-cluster-controller-pdb", Namespace: "castai-agent"},
+		Spec: policyv1.PodDisruptionBudgetSpec{
+			Selector:     &metav1.LabelSelector{MatchLabels: map[string]string{"app.kubernetes.io/name": "castai-cluster-controller"}},
+			MinAvailable: intstrPtr(intstr.FromInt32(1)),
+		},
+	}
+	two := int32(2)
+	deploy := &appsv1.Deployment{
+		ObjectMeta: metav1.ObjectMeta{Name: "castai-cluster-controller", Namespace: "castai-agent"},
+		Spec: appsv1.DeploymentSpec{
+			Replicas: &two,
+			Selector: &metav1.LabelSelector{MatchLabels: map[string]string{"app.kubernetes.io/name": "castai-cluster-controller"}},
+			Template: corev1.PodTemplateSpec{
+				ObjectMeta: metav1.ObjectMeta{Labels: map[string]string{
+					"app.kubernetes.io/name":     "castai-cluster-controller",
+					"app.kubernetes.io/instance": "cluster-controller",
+				}},
+			},
+		},
+	}
+	clientset := fake.NewSimpleClientset(helmPDB, leftover, deploy)
+
+	createPDBForWorkload(context.Background(), clientset, deploy)
+
+	if _, err := clientset.PolicyV1().PodDisruptionBudgets("castai-agent").Get(context.Background(), "castai-cluster-controller-pdb", metav1.GetOptions{}); !apierrors.IsNotFound(err) {
+		t.Fatalf("expected leftover controller PDB to be deleted, got err=%v", err)
+	}
+	got, err := clientset.PolicyV1().PodDisruptionBudgets("castai-agent").Get(context.Background(), "castai-cluster-controller", metav1.GetOptions{})
+	if err != nil {
+		t.Fatalf("expected CAST Helm PDB to remain: %v", err)
+	}
+	if got.Spec.MaxUnavailable == nil || got.Spec.MinAvailable != nil {
+		t.Fatalf("expected Helm PDB untouched, got MinAvailable=%v MaxUnavailable=%v", got.Spec.MinAvailable, got.Spec.MaxUnavailable)
+	}
+}
+
+func TestCreatePDBForWorkload_keepsCustomerControllerPDBWhenUnrelatedHelmCovers(t *testing.T) {
+	resetDefaultPDBConfig()
+	t.Cleanup(resetDefaultPDBConfig)
+
+	helmPDB := &policyv1.PodDisruptionBudget{
+		ObjectMeta: metav1.ObjectMeta{Name: "my-helm-pdb", Namespace: "default"},
+		Spec: policyv1.PodDisruptionBudgetSpec{
+			Selector:     &metav1.LabelSelector{MatchLabels: map[string]string{"app": "myapp"}},
+			MinAvailable: intstrPtr(intstr.FromInt32(1)),
+		},
+	}
+	controllerPDB := &policyv1.PodDisruptionBudget{
+		ObjectMeta: metav1.ObjectMeta{Name: "castai-myapp-pdb", Namespace: "default"},
+		Spec: policyv1.PodDisruptionBudgetSpec{
+			Selector:     &metav1.LabelSelector{MatchLabels: map[string]string{"app": "myapp"}},
+			MinAvailable: intstrPtr(intstr.FromInt32(1)),
+		},
+	}
+	two := int32(2)
+	deploy := &appsv1.Deployment{
+		ObjectMeta: metav1.ObjectMeta{Name: "myapp", Namespace: "default"},
+		Spec: appsv1.DeploymentSpec{
+			Replicas: &two,
+			Selector: &metav1.LabelSelector{MatchLabels: map[string]string{"app": "myapp"}},
+			Template: corev1.PodTemplateSpec{
+				ObjectMeta: metav1.ObjectMeta{Labels: map[string]string{"app": "myapp"}},
+			},
+		},
+	}
+	clientset := fake.NewSimpleClientset(helmPDB, controllerPDB, deploy)
+
+	createPDBForWorkload(context.Background(), clientset, deploy)
+
+	if _, err := clientset.PolicyV1().PodDisruptionBudgets("default").Get(context.Background(), "castai-myapp-pdb", metav1.GetOptions{}); err != nil {
+		t.Fatalf("expected customer controller PDB to be preserved, got err=%v", err)
+	}
+	if _, err := clientset.PolicyV1().PodDisruptionBudgets("default").Get(context.Background(), "my-helm-pdb", metav1.GetOptions{}); err != nil {
+		t.Fatalf("expected Helm PDB to remain: %v", err)
+	}
+}
+
+func TestScanAllPDBsForMultiplePDBs_deletesLeftoverWhenCastaiHelmCovers(t *testing.T) {
+	helmPDB := &policyv1.PodDisruptionBudget{
+		ObjectMeta: metav1.ObjectMeta{Name: "castai-agent", Namespace: "castai-agent"},
+		Spec: policyv1.PodDisruptionBudgetSpec{
+			Selector:       &metav1.LabelSelector{MatchLabels: map[string]string{"app.kubernetes.io/name": "castai-agent"}},
+			MaxUnavailable: intstrPtr(intstr.FromInt32(1)),
+		},
+	}
+	leftover := &policyv1.PodDisruptionBudget{
+		ObjectMeta: metav1.ObjectMeta{Name: "castai-agent-pdb", Namespace: "castai-agent"},
+		Spec: policyv1.PodDisruptionBudgetSpec{
+			Selector:     &metav1.LabelSelector{MatchLabels: map[string]string{"app.kubernetes.io/name": "castai-agent"}},
+			MinAvailable: intstrPtr(intstr.FromInt32(1)),
+		},
+	}
+	two := int32(2)
+	deploy := &appsv1.Deployment{
+		ObjectMeta: metav1.ObjectMeta{Name: "castai-agent", Namespace: "castai-agent"},
+		Spec: appsv1.DeploymentSpec{
+			Replicas: &two,
+			Selector: &metav1.LabelSelector{MatchLabels: map[string]string{"app.kubernetes.io/name": "castai-agent"}},
+			Template: corev1.PodTemplateSpec{
+				ObjectMeta: metav1.ObjectMeta{Labels: map[string]string{
+					"app.kubernetes.io/name":     "castai-agent",
+					"app.kubernetes.io/instance": "agent",
+				}},
+			},
+		},
+	}
+	ns := &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: "castai-agent"}}
+	clientset := fake.NewSimpleClientset(ns, helmPDB, leftover, deploy)
+
+	scanAllPDBsForMultiplePDBs(context.Background(), clientset)
+
+	if _, err := clientset.PolicyV1().PodDisruptionBudgets("castai-agent").Get(context.Background(), "castai-agent-pdb", metav1.GetOptions{}); !apierrors.IsNotFound(err) {
+		t.Fatalf("expected leftover controller PDB deleted by scan, got err=%v", err)
+	}
+	if _, err := clientset.PolicyV1().PodDisruptionBudgets("castai-agent").Get(context.Background(), "castai-agent", metav1.GetOptions{}); err != nil {
+		t.Fatalf("expected CAST Helm PDB to remain: %v", err)
+	}
+}
+
+func TestScanAllPDBsForMultiplePDBs_keepsCustomerControllerPDB(t *testing.T) {
+	helmPDB := &policyv1.PodDisruptionBudget{
+		ObjectMeta: metav1.ObjectMeta{Name: "my-helm-pdb", Namespace: "default"},
+		Spec: policyv1.PodDisruptionBudgetSpec{
+			Selector:     &metav1.LabelSelector{MatchLabels: map[string]string{"app": "myapp", "shard": "0"}},
+			MinAvailable: intstrPtr(intstr.FromInt32(1)),
+		},
+	}
+	controllerPDB := &policyv1.PodDisruptionBudget{
+		ObjectMeta: metav1.ObjectMeta{Name: "castai-myapp-pdb", Namespace: "default"},
+		Spec: policyv1.PodDisruptionBudgetSpec{
+			Selector:     &metav1.LabelSelector{MatchLabels: map[string]string{"app": "myapp"}},
+			MinAvailable: intstrPtr(intstr.FromInt32(1)),
+		},
+	}
+	two := int32(2)
+	deploy := &appsv1.Deployment{
+		ObjectMeta: metav1.ObjectMeta{Name: "myapp", Namespace: "default"},
+		Spec: appsv1.DeploymentSpec{
+			Replicas: &two,
+			Selector: &metav1.LabelSelector{MatchLabels: map[string]string{"app": "myapp"}},
+			Template: corev1.PodTemplateSpec{
+				ObjectMeta: metav1.ObjectMeta{Labels: map[string]string{"app": "myapp", "shard": "0"}},
+			},
+		},
+	}
+	ns := &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: "default"}}
+	clientset := fake.NewSimpleClientset(ns, helmPDB, controllerPDB, deploy)
+
+	scanAllPDBsForMultiplePDBs(context.Background(), clientset)
+
+	if _, err := clientset.PolicyV1().PodDisruptionBudgets("default").Get(context.Background(), "castai-myapp-pdb", metav1.GetOptions{}); err != nil {
+		t.Fatalf("expected customer controller PDB preserved by scan, got err=%v", err)
+	}
+}
+
 func TestGarbageCollectOrphanedPDBs_deletesWhenWorkloadGone(t *testing.T) {
 	pdb := &policyv1.PodDisruptionBudget{
 		ObjectMeta: metav1.ObjectMeta{Name: "castai-gone-pdb", Namespace: "default"},

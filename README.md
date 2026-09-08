@@ -45,6 +45,9 @@ This controller enables safe, automated disruption management with per-workload 
 - **Controller-Owned PDB Naming Convention:**  
   The controller only treats a matching PDB as its own (safe to update to match its own config) when the PDB's name both starts with `castai-` **and** ends with `-pdb` — the exact pattern it uses when generating PDBs (`castai-<workload>-pdb`). Any other matching PDB, including ones from Helm charts whose release name happens to start with `castai-` (e.g. `castai-agent`, `castai-cluster-controller`, `castai-pod-mutator`), is treated as externally managed: the controller leaves it untouched and skips creating its own.
 
+- **CAST Component Leftover Cleanup:**  
+  On reconcile and during the periodic multi-PDB scan, if a CAST Helm-style PDB (`castai-*` without the `-pdb` suffix) already covers a workload and a leftover controller-owned `castai-*-pdb` also covers it, the controller deletes only the leftover controller PDB. Customer `castai-*-pdb` objects covered solely by unrelated Helm PDBs are left alone so controller-managed customer workloads stay intact.
+
 - **Configurable log levels:**  
   Set `logLevel` in the `castai-pdb-controller-config` ConfigMap to `debug`, `info`, `warn`, or `error` (default `info`) to control how much the controller writes to stderr.
 
