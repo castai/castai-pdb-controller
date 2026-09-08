@@ -236,16 +236,21 @@ func isCastaiHelmStylePDB(name string) bool {
 
 // pdbCoversPodTemplate reports whether pdb's selector matches the workload's
 // pod template labels (coverage match used by create and multi-PDB cleanup).
-func pdbCoversPodTemplate(pdb *policyv1.PodDisruptionBudget, podTemplateLabels map[string]string) bool {
+// When the PDB covers the template, the parsed selector is also returned so
+// callers can reuse it (e.g. exact-match checks) without converting twice.
+func pdbCoversPodTemplate(pdb *policyv1.PodDisruptionBudget, podTemplateLabels map[string]string) (bool, labels.Selector) {
 	if pdb == nil || pdb.Spec.Selector == nil {
-		return false
+		return false, nil
 	}
 	pdbSel, err := metav1.LabelSelectorAsSelector(pdb.Spec.Selector)
 	if err != nil {
 		logWarnf("PDB %s/%s has an invalid selector and will be ignored: %v", pdb.Namespace, pdb.Name, err)
-		return false
+		return false, nil
 	}
-	return pdbSel.Matches(labels.Set(podTemplateLabels))
+	if !pdbSel.Matches(labels.Set(podTemplateLabels)) {
+		return false, nil
+	}
+	return true, pdbSel
 }
 
 // deleteLeftoverControllerPDBsForCastaiHelm removes covering controller-owned
@@ -1264,22 +1269,23 @@ func createPDBForWorkload(ctx context.Context, clientset kubernetes.Interface, o
 	var existingNonCastaiPDB *policyv1.PodDisruptionBudget
 	var existingCastaiExact bool
 	var coveringPDBs []*policyv1.PodDisruptionBudget
+	var coveringNonControllerNames []string
 
 	for i := range pdbList.Items {
 		pdb := &pdbList.Items[i]
-		if !pdbCoversPodTemplate(pdb, podTemplateLabels) {
+		covers, pdbSel := pdbCoversPodTemplate(pdb, podTemplateLabels)
+		if !covers {
 			continue
 		}
 		coveringPDBs = append(coveringPDBs, pdb)
-		pdbSel, selErr := metav1.LabelSelectorAsSelector(pdb.Spec.Selector)
-		exact := selErr == nil && pdbSel.String() == workloadSel.String()
+		exact := pdbSel.String() == workloadSel.String()
 		// A match via non-identical selectors means this PDB's selector is a
 		// superset (or otherwise differently-shaped) match rather than an exact
 		// one. This is expected for e.g. Helm-managed PDBs, but is also the
 		// pattern that can cause an accidental cross-workload match if two
 		// sibling workloads share labels without a disambiguating key. Log it
 		// so operators have visibility into non-exact matches.
-		if !exact && selErr == nil {
+		if !exact {
 			logWarnf("PDB %s/%s covers workload %s/%s via a non-identical selector (PDB selector: %q, workload selector: %q)\n",
 				namespace, pdb.Name, namespace, name, pdbSel.String(), workloadSel.String())
 		}
@@ -1290,9 +1296,12 @@ func createPDBForWorkload(ctx context.Context, clientset kubernetes.Interface, o
 				existingCastaiPDB = pdb
 				existingCastaiExact = exact
 			}
-		} else if existingNonCastaiPDB == nil {
-			// First covering non-castai PDB wins (skip-create path).
-			existingNonCastaiPDB = pdb
+		} else {
+			coveringNonControllerNames = append(coveringNonControllerNames, pdb.Name)
+			// First covering non-castai PDB wins for skip-create bookkeeping.
+			if existingNonCastaiPDB == nil {
+				existingNonCastaiPDB = pdb
+			}
 		}
 	}
 
@@ -1307,7 +1316,8 @@ func createPDBForWorkload(ctx context.Context, clientset kubernetes.Interface, o
 		skipLogTimesLock.Lock()
 		last, ok := skipLogTimes[key]
 		if !ok || now.Sub(last) > logInterval {
-			logInfof("Skipping PDB creation for %s/%s: existing non-castai PDB %s found", namespace, name, existingNonCastaiPDB.Name)
+			logInfof("Skipping PDB creation for %s/%s: existing non-castai PDB(s) %s found",
+				namespace, name, strings.Join(coveringNonControllerNames, ", "))
 			skipLogTimes[key] = now
 		}
 		skipLogTimesLock.Unlock()
@@ -1339,7 +1349,7 @@ func createPDBForWorkload(ctx context.Context, clientset kubernetes.Interface, o
 			continue
 		}
 		for _, pdb := range pdbListAfter.Items {
-			if pdbCoversPodTemplate(&pdb, podTemplateLabels) {
+			if covers, _ := pdbCoversPodTemplate(&pdb, podTemplateLabels); covers {
 				logInfof("Skipping PDB creation for %s/%s: PDB %s was created after initial check", namespace, name, pdb.Name)
 				return
 			}
@@ -1861,15 +1871,12 @@ func cleanupMultiplePDBsForWorkload(ctx context.Context, clientset kubernetes.In
 	if annotations != nil && annotations[annotationBypass] == "true" {
 		return
 	}
-	if len(podTemplateLabels) == 0 {
-		return
-	}
 
 	covering := make([]*policyv1.PodDisruptionBudget, 0)
 	nonControllerCount := 0
 	for i := range pdbs {
 		pdb := &pdbs[i]
-		if !pdbCoversPodTemplate(pdb, podTemplateLabels) {
+		if covers, _ := pdbCoversPodTemplate(pdb, podTemplateLabels); !covers {
 			continue
 		}
 		covering = append(covering, pdb)
