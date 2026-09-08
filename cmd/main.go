@@ -242,6 +242,7 @@ func pdbCoversPodTemplate(pdb *policyv1.PodDisruptionBudget, podTemplateLabels m
 	}
 	pdbSel, err := metav1.LabelSelectorAsSelector(pdb.Spec.Selector)
 	if err != nil {
+		logWarnf("PDB %s/%s has an invalid selector and will be ignored: %v", pdb.Namespace, pdb.Name, err)
 		return false
 	}
 	return pdbSel.Matches(labels.Set(podTemplateLabels))
