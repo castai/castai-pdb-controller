@@ -77,6 +77,11 @@ var (
 	warnLogTimesLock sync.Mutex
 	fixLogTimes      = make(map[string]time.Time)
 	fixLogTimesLock  sync.Mutex
+
+	// First time a controller-owned PDB was observed with DisruptionsAllowed==0
+	// (and populated status). Used only for warning duration; never drives deletes.
+	disruptionBlockedSince     = make(map[string]time.Time)
+	disruptionBlockedSinceLock sync.Mutex
 )
 
 // isWorkloadExcluded checks if a workload should be excluded from PDB creation based on exclusion rules
@@ -208,17 +213,50 @@ const (
 
 // deleteCastaiPDBIfUnderReplicated removes the castai-managed PDB when a workload has
 // fewer than 2 replicas. Returns true when the caller should stop processing.
+// Logs only when a PDB is actually deleted — single-replica workloads are reconciled
+// often, and logging "deleting" on every NotFound no-op was misleading/noisy.
 func deleteCastaiPDBIfUnderReplicated(ctx context.Context, clientset kubernetes.Interface, namespace, workloadName string, replicas *int32) bool {
 	if replicas != nil && *replicas >= 2 {
 		return false
 	}
 	pdbName := fmt.Sprintf("castai-%s-pdb", workloadName)
-	logInfof("Workload %s/%s has fewer than 2 replicas; deleting PDB %s to prevent blocking disruptions\n", namespace, workloadName, pdbName)
 	err := clientset.PolicyV1().PodDisruptionBudgets(namespace).Delete(ctx, pdbName, metav1.DeleteOptions{})
-	if err != nil && !apierrors.IsNotFound(err) {
+	if err == nil {
+		logInfof("Workload %s/%s has fewer than 2 replicas; deleted PDB %s to prevent blocking disruptions\n", namespace, workloadName, pdbName)
+	} else if apierrors.IsNotFound(err) {
+		logDebugf("Workload %s/%s has fewer than 2 replicas; no PDB %s to delete\n", namespace, workloadName, pdbName)
+	} else {
 		logErrorf("Failed to delete PDB %s/%s for scaled-down workload: %v\n", namespace, pdbName, err)
 	}
 	return true
+}
+
+// workloadReplicaHealth reads desired/ready/available replica counts from a
+// Deployment or StatefulSet. StatefulSets have no AvailableReplicas; available
+// is set equal to ready so callers can use one comparison path.
+func workloadReplicaHealth(obj interface{}) (desired, ready, available int32, ok bool) {
+	switch w := obj.(type) {
+	case *appsv1.Deployment:
+		desired = 1
+		if w.Spec.Replicas != nil {
+			desired = *w.Spec.Replicas
+		}
+		return desired, w.Status.ReadyReplicas, w.Status.AvailableReplicas, true
+	case *appsv1.StatefulSet:
+		desired = 1
+		if w.Spec.Replicas != nil {
+			desired = *w.Spec.Replicas
+		}
+		return desired, w.Status.ReadyReplicas, w.Status.ReadyReplicas, true
+	default:
+		return 0, 0, 0, false
+	}
+}
+
+// workloadReadyForNewPDB reports whether a multi-replica workload is fully
+// ready/available and safe to receive a newly created castai PDB.
+func workloadReadyForNewPDB(desired, ready, available int32) bool {
+	return desired >= 2 && ready >= desired && available >= desired
 }
 
 // isControllerOwnedPDB reports whether the PDB was created by this controller.
@@ -812,6 +850,9 @@ func resetDefaultPDBConfig() {
 	defaultPDBConfig.AdditionalSelectorLabels = nil
 	defaultPDBConfig.UnhealthyPodEvictionPolicy = nil
 	defaultPDBConfigLock.Unlock()
+	disruptionBlockedSinceLock.Lock()
+	disruptionBlockedSince = make(map[string]time.Time)
+	disruptionBlockedSinceLock.Unlock()
 	syncLogLevelFromData(nil)
 	logInfof("Default PDB config reset: using built-in fallback\n")
 }
@@ -901,6 +942,7 @@ func runController(ctx context.Context, clientset *kubernetes.Clientset) {
 				}
 				scanAllPDBsForPoorConfig(ctx, clientset)
 				scanAllPDBsForMultiplePDBs(ctx, clientset)
+				scanAllPDBsForDisruptionBlocks(ctx, clientset)
 			case <-ctx.Done():
 				return
 			}
@@ -1324,9 +1366,26 @@ func createPDBForWorkload(ctx context.Context, clientset kubernetes.Interface, o
 		return
 	}
 
-	// If a castai PDB exists, update it
+	// If a castai PDB exists, update it (do not delete for unreadiness — log via scan).
 	if existingCastaiPDB != nil {
 		updateExistingPDB(ctx, clientset, existingCastaiPDB, workloadAnnotations, replicas, namespace, name, obj)
+		return
+	}
+
+	// New PDB only: require pods to be ready and available before creating.
+	// Unready multi-replica workloads (e.g. crash-looping) would get a PDB that
+	// can sit at disruptionsAllowed=0 and block node drains; skip and log instead.
+	if desired, ready, available, ok := workloadReplicaHealth(obj); ok && !workloadReadyForNewPDB(desired, ready, available) {
+		key := fmt.Sprintf("%s/%s/not-ready", namespace, name)
+		now := time.Now()
+		skipLogTimesLock.Lock()
+		last, seen := skipLogTimes[key]
+		if !seen || now.Sub(last) > logInterval {
+			logWarnf("Skipping PDB creation for %s/%s: workload not ready (ready=%d/%d, available=%d/%d) — creating a PDB now may block drains while pods are unhealthy",
+				namespace, name, ready, desired, available, desired)
+			skipLogTimes[key] = now
+		}
+		skipLogTimesLock.Unlock()
 		return
 	}
 
@@ -1825,6 +1884,73 @@ func isPoorPDBConfig(pdb *policyv1.PodDisruptionBudget, replicas int32) bool {
 		}
 	}
 	return false
+}
+
+// scanAllPDBsForDisruptionBlocks rate-limited-warns when a controller-owned PDB
+// has DisruptionsAllowed==0 with populated status. This surfaces stuck budgets
+// (e.g. crash-looping workloads under IfHealthyBudget) without deleting PDBs.
+func scanAllPDBsForDisruptionBlocks(ctx context.Context, clientset kubernetes.Interface) {
+	pdbs, err := clientset.PolicyV1().PodDisruptionBudgets("").List(ctx, metav1.ListOptions{})
+	if err != nil {
+		logErrorf("Failed to list PDBs for disruption-block scan: %v", err)
+		return
+	}
+
+	defaultPDBConfigLock.RLock()
+	logInterval := defaultPDBConfig.LogInterval
+	defaultPDBConfigLock.RUnlock()
+	if logInterval <= 0 {
+		logInterval = defaultLogInterval
+	}
+
+	now := time.Now()
+	seen := make(map[string]struct{})
+
+	for i := range pdbs.Items {
+		pdb := &pdbs.Items[i]
+		if !isControllerOwnedPDB(pdb.Name) {
+			continue
+		}
+		key := pdb.Namespace + "/" + pdb.Name
+		seen[key] = struct{}{}
+
+		// Empty/zero status is normal right after create; only warn once the
+		// disruption controller has populated ExpectedPods / DesiredHealthy.
+		statusPopulated := pdb.Status.ExpectedPods > 0 || pdb.Status.DesiredHealthy > 0
+		if !statusPopulated || pdb.Status.DisruptionsAllowed > 0 {
+			disruptionBlockedSinceLock.Lock()
+			delete(disruptionBlockedSince, key)
+			disruptionBlockedSinceLock.Unlock()
+			continue
+		}
+
+		disruptionBlockedSinceLock.Lock()
+		since, ok := disruptionBlockedSince[key]
+		if !ok {
+			disruptionBlockedSince[key] = now
+			since = now
+		}
+		disruptionBlockedSinceLock.Unlock()
+
+		warnKey := key + "/disruptions-blocked"
+		warnLogTimesLock.Lock()
+		last, logged := warnLogTimes[warnKey]
+		if !logged || now.Sub(last) > logInterval {
+			logWarnf("WARNING: PDB %s has disruptionsAllowed=0 for %s (currentHealthy=%d, desiredHealthy=%d, expectedPods=%d) — this can block node drains when pods are NotReady under IfHealthyBudget",
+				key, now.Sub(since).Round(time.Second), pdb.Status.CurrentHealthy, pdb.Status.DesiredHealthy, pdb.Status.ExpectedPods)
+			warnLogTimes[warnKey] = now
+		}
+		warnLogTimesLock.Unlock()
+	}
+
+	// Drop tracking for PDBs that no longer exist.
+	disruptionBlockedSinceLock.Lock()
+	for key := range disruptionBlockedSince {
+		if _, ok := seen[key]; !ok {
+			delete(disruptionBlockedSince, key)
+		}
+	}
+	disruptionBlockedSinceLock.Unlock()
 }
 
 // Scans for workloads targeted by multiple PDBs. When a CAST Helm-style PDB

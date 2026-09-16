@@ -435,6 +435,11 @@ func TestDeleteCastaiPDBIfUnderReplicated(t *testing.T) {
 	if _, err := clientset.PolicyV1().PodDisruptionBudgets("default").Get(ctx, "castai-myapp-pdb", metav1.GetOptions{}); !apierrors.IsNotFound(err) {
 		t.Fatalf("PDB should be deleted for single replica, got err=%v", err)
 	}
+
+	// Second call: PDB already gone — still stops processing, but is a no-op delete.
+	if !deleteCastaiPDBIfUnderReplicated(ctx, clientset, "default", "myapp", &one) {
+		t.Fatal("single replica with missing PDB should still stop processing")
+	}
 }
 
 func TestWaitForPDBDeletion_returnsWhenPDBIsGone(t *testing.T) {
@@ -515,6 +520,7 @@ func TestUpdateExistingPDB_recreatesWhenSelectorChanges(t *testing.T) {
 				ObjectMeta: metav1.ObjectMeta{Labels: map[string]string{"app": "myapp", "role": "worker"}},
 			},
 		},
+		Status: appsv1.DeploymentStatus{ReadyReplicas: 2, AvailableReplicas: 2},
 	}
 
 	updateExistingPDB(context.Background(), clientset, existingPDB, nil, &two, "default", "myapp", dep)
@@ -996,12 +1002,203 @@ func TestCreatePDBForWorkload_createsWhenExistingPDBDoesNotCoverPods(t *testing.
 				ObjectMeta: metav1.ObjectMeta{Labels: map[string]string{"app": "myapp"}},
 			},
 		},
+		Status: appsv1.DeploymentStatus{ReadyReplicas: 2, AvailableReplicas: 2},
 	}
 
 	createPDBForWorkload(context.Background(), clientset, dep)
 
 	if _, err := clientset.PolicyV1().PodDisruptionBudgets("default").Get(context.Background(), "castai-myapp-pdb", metav1.GetOptions{}); err != nil {
 		t.Fatalf("expected castai PDB to be created when pre-existing PDB does not cover pods, got err=%v", err)
+	}
+}
+
+func TestWorkloadReadyForNewPDB(t *testing.T) {
+	if !workloadReadyForNewPDB(2, 2, 2) {
+		t.Fatal("expected ready when ready/available match desired")
+	}
+	if workloadReadyForNewPDB(2, 0, 0) {
+		t.Fatal("expected not ready when zero ready")
+	}
+	if workloadReadyForNewPDB(2, 1, 1) {
+		t.Fatal("expected not ready when only partially ready")
+	}
+	if workloadReadyForNewPDB(2, 2, 1) {
+		t.Fatal("expected not ready when available lags ready")
+	}
+	if workloadReadyForNewPDB(1, 1, 1) {
+		t.Fatal("expected not ready for single-replica desired count")
+	}
+}
+
+func TestCreatePDBForWorkload_skipsWhenWorkloadNotReady(t *testing.T) {
+	resetDefaultPDBConfig()
+	t.Cleanup(resetDefaultPDBConfig)
+
+	two := int32(2)
+	dep := &appsv1.Deployment{
+		ObjectMeta: metav1.ObjectMeta{Name: "crashloop", Namespace: "default"},
+		Spec: appsv1.DeploymentSpec{
+			Replicas: &two,
+			Selector: &metav1.LabelSelector{MatchLabels: map[string]string{"app": "crashloop"}},
+			Template: corev1.PodTemplateSpec{
+				ObjectMeta: metav1.ObjectMeta{Labels: map[string]string{"app": "crashloop"}},
+			},
+		},
+		Status: appsv1.DeploymentStatus{ReadyReplicas: 0, AvailableReplicas: 0},
+	}
+	clientset := fake.NewSimpleClientset()
+
+	createPDBForWorkload(context.Background(), clientset, dep)
+
+	pdbs, err := clientset.PolicyV1().PodDisruptionBudgets("default").List(context.Background(), metav1.ListOptions{})
+	if err != nil {
+		t.Fatalf("list PDBs: %v", err)
+	}
+	if len(pdbs.Items) != 0 {
+		t.Fatalf("expected no PDB when workload is not ready, got %#v", pdbs.Items)
+	}
+}
+
+func TestCreatePDBForWorkload_skipsWhenPartiallyReady(t *testing.T) {
+	resetDefaultPDBConfig()
+	t.Cleanup(resetDefaultPDBConfig)
+
+	two := int32(2)
+	dep := &appsv1.Deployment{
+		ObjectMeta: metav1.ObjectMeta{Name: "rolling", Namespace: "default"},
+		Spec: appsv1.DeploymentSpec{
+			Replicas: &two,
+			Selector: &metav1.LabelSelector{MatchLabels: map[string]string{"app": "rolling"}},
+			Template: corev1.PodTemplateSpec{
+				ObjectMeta: metav1.ObjectMeta{Labels: map[string]string{"app": "rolling"}},
+			},
+		},
+		Status: appsv1.DeploymentStatus{ReadyReplicas: 1, AvailableReplicas: 1},
+	}
+	clientset := fake.NewSimpleClientset()
+
+	createPDBForWorkload(context.Background(), clientset, dep)
+
+	pdbs, err := clientset.PolicyV1().PodDisruptionBudgets("default").List(context.Background(), metav1.ListOptions{})
+	if err != nil {
+		t.Fatalf("list PDBs: %v", err)
+	}
+	if len(pdbs.Items) != 0 {
+		t.Fatalf("expected no PDB while only partially ready, got %#v", pdbs.Items)
+	}
+}
+
+func TestCreatePDBForWorkload_createsWhenFullyReady(t *testing.T) {
+	resetDefaultPDBConfig()
+	t.Cleanup(resetDefaultPDBConfig)
+
+	two := int32(2)
+	dep := &appsv1.Deployment{
+		ObjectMeta: metav1.ObjectMeta{Name: "healthy", Namespace: "default"},
+		Spec: appsv1.DeploymentSpec{
+			Replicas: &two,
+			Selector: &metav1.LabelSelector{MatchLabels: map[string]string{"app": "healthy"}},
+			Template: corev1.PodTemplateSpec{
+				ObjectMeta: metav1.ObjectMeta{Labels: map[string]string{"app": "healthy"}},
+			},
+		},
+		Status: appsv1.DeploymentStatus{ReadyReplicas: 2, AvailableReplicas: 2},
+	}
+	clientset := fake.NewSimpleClientset()
+
+	createPDBForWorkload(context.Background(), clientset, dep)
+
+	if _, err := clientset.PolicyV1().PodDisruptionBudgets("default").Get(context.Background(), "castai-healthy-pdb", metav1.GetOptions{}); err != nil {
+		t.Fatalf("expected PDB when fully ready, got err=%v", err)
+	}
+}
+
+func TestCreatePDBForWorkload_preservesExistingWhenReadinessDrops(t *testing.T) {
+	resetDefaultPDBConfig()
+	t.Cleanup(resetDefaultPDBConfig)
+
+	two := int32(2)
+	existing := &policyv1.PodDisruptionBudget{
+		ObjectMeta: metav1.ObjectMeta{Name: "castai-myapp-pdb", Namespace: "default"},
+		Spec: policyv1.PodDisruptionBudgetSpec{
+			Selector:     &metav1.LabelSelector{MatchLabels: map[string]string{"app": "myapp"}},
+			MinAvailable: intstrPtr(intstr.FromInt32(1)),
+		},
+	}
+	dep := &appsv1.Deployment{
+		ObjectMeta: metav1.ObjectMeta{Name: "myapp", Namespace: "default"},
+		Spec: appsv1.DeploymentSpec{
+			Replicas: &two,
+			Selector: &metav1.LabelSelector{MatchLabels: map[string]string{"app": "myapp"}},
+			Template: corev1.PodTemplateSpec{
+				ObjectMeta: metav1.ObjectMeta{Labels: map[string]string{"app": "myapp"}},
+			},
+		},
+		Status: appsv1.DeploymentStatus{ReadyReplicas: 0, AvailableReplicas: 0},
+	}
+	clientset := fake.NewSimpleClientset(existing)
+
+	createPDBForWorkload(context.Background(), clientset, dep)
+
+	if _, err := clientset.PolicyV1().PodDisruptionBudgets("default").Get(context.Background(), "castai-myapp-pdb", metav1.GetOptions{}); err != nil {
+		t.Fatalf("expected existing castai PDB to be preserved when readiness drops, got err=%v", err)
+	}
+}
+
+func TestScanAllPDBsForDisruptionBlocks_warnsButDoesNotDelete(t *testing.T) {
+	resetDefaultPDBConfig()
+	t.Cleanup(resetDefaultPDBConfig)
+
+	defaultPDBConfigLock.Lock()
+	defaultPDBConfig.LogInterval = time.Millisecond
+	defaultPDBConfigLock.Unlock()
+
+	pdb := &policyv1.PodDisruptionBudget{
+		ObjectMeta: metav1.ObjectMeta{Name: "castai-stuck-pdb", Namespace: "default"},
+		Spec: policyv1.PodDisruptionBudgetSpec{
+			Selector:     &metav1.LabelSelector{MatchLabels: map[string]string{"app": "stuck"}},
+			MinAvailable: intstrPtr(intstr.FromInt32(1)),
+		},
+		Status: policyv1.PodDisruptionBudgetStatus{
+			DisruptionsAllowed: 0,
+			CurrentHealthy:     0,
+			DesiredHealthy:     1,
+			ExpectedPods:       2,
+		},
+	}
+	foreign := &policyv1.PodDisruptionBudget{
+		ObjectMeta: metav1.ObjectMeta{Name: "helm-managed", Namespace: "default"},
+		Spec: policyv1.PodDisruptionBudgetSpec{
+			Selector:     &metav1.LabelSelector{MatchLabels: map[string]string{"app": "other"}},
+			MinAvailable: intstrPtr(intstr.FromInt32(1)),
+		},
+		Status: policyv1.PodDisruptionBudgetStatus{
+			DisruptionsAllowed: 0,
+			CurrentHealthy:     0,
+			DesiredHealthy:     1,
+			ExpectedPods:       2,
+		},
+	}
+	clientset := fake.NewSimpleClientset(pdb, foreign)
+
+	scanAllPDBsForDisruptionBlocks(context.Background(), clientset)
+
+	if _, err := clientset.PolicyV1().PodDisruptionBudgets("default").Get(context.Background(), "castai-stuck-pdb", metav1.GetOptions{}); err != nil {
+		t.Fatalf("scan must not delete controller PDB, got err=%v", err)
+	}
+	if _, err := clientset.PolicyV1().PodDisruptionBudgets("default").Get(context.Background(), "helm-managed", metav1.GetOptions{}); err != nil {
+		t.Fatalf("scan must not delete non-controller PDB, got err=%v", err)
+	}
+
+	disruptionBlockedSinceLock.Lock()
+	_, tracked := disruptionBlockedSince["default/castai-stuck-pdb"]
+	_, trackedForeign := disruptionBlockedSince["default/helm-managed"]
+	disruptionBlockedSinceLock.Unlock()
+	if !tracked {
+		t.Fatal("expected stuck controller PDB to be tracked for disruption duration")
+	}
+	if trackedForeign {
+		t.Fatal("expected non-controller PDB not to be tracked")
 	}
 }
 
