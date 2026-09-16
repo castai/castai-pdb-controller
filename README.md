@@ -48,6 +48,12 @@ This controller enables safe, automated disruption management with per-workload 
 - **CAST Component Leftover Cleanup:**  
   On reconcile and during the periodic multi-PDB scan, if a CAST Helm-style PDB (`castai-*` without the `-pdb` suffix) already covers a workload and a leftover controller-owned `castai-*-pdb` also covers it, the controller deletes only the leftover controller PDB. Customer `castai-*-pdb` objects covered solely by unrelated Helm PDBs are left alone so controller-managed customer workloads stay intact.
 
+- **New-PDB readiness gate:**  
+  After the multi-replica check (`>= 2`), the controller only **creates** a new castai PDB when the workload is fully ready and available (`ReadyReplicas` and `AvailableReplicas` both `>=` desired; StatefulSets use ready only). If pods are not ready yet (cold start, crash-loop, mid-rollout), creation is skipped and a warning is logged. Existing controller PDBs are **not** deleted for unreadiness.
+
+- **Disruption-block warnings:**  
+  The periodic scan warns (rate-limited) when a controller-owned PDB has `disruptionsAllowed=0` with populated status (`currentHealthy` / `desiredHealthy` / `expectedPods` and how long it has been stuck). This surfaces drain-blocking budgets without removing the PDB. Operators who want NotReady pods to remain evictable can still set the optional `defaultUnhealthyPodEvictionPolicy` / annotation overrides (`AlwaysAllow`); those are not enabled by default.
+
 - **Configurable log levels:**  
   Set `logLevel` in the `castai-pdb-controller-config` ConfigMap to `debug`, `info`, `warn`, or `error` (default `info`) to control how much the controller writes to stderr.
 
@@ -298,7 +304,9 @@ spec:
 - **Duplicate logs:**  
   Usually caused by log collector configuration, not the controller itself.
 - **No PDB created:**  
-  Ensure your workload has at least 2 replicas and is not opted out with the bypass annotation.
+  Ensure your workload has at least 2 replicas, those replicas are ready/available, and the workload is not opted out with the bypass annotation. Check controller logs for `workload not ready` skip messages.
+- **PDB reports disruptionsAllowed=0:**  
+  Look for `disruptionsAllowed=0` warnings from the controller. The controller does not delete existing PDBs for this reason; fix the workload health or adjust PDB/`unhealthyPodEvictionPolicy` overrides intentionally.
 - **RBAC errors:**  
   Make sure your controller has permissions to list namespaces and manage PDBs.
 
