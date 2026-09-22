@@ -11,6 +11,7 @@ jobs:
     permissions:
       contents: read
       id-token: write
+      packages: write
     steps:
       - name: Checkout
         uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
@@ -24,6 +25,13 @@ jobs:
 
       - name: Configure Docker for GAR
         run: gcloud auth configure-docker us-docker.pkg.dev
+
+      - name: Login to GitHub Container Registry
+        uses: docker/login-action@5e57cd118135c172c3672efd75eb46360885c0ef # v3.6.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Set up QEMU
         uses: docker/setup-qemu-action@06116385d9baf250c9f4dcb4858b16962ea869c3 # v4.1.0
@@ -44,6 +52,8 @@ jobs:
           tags: |
             us-docker.pkg.dev/castai-hub/library/castai-pdb-controller:${{ steps.version.outputs.tag }}
             us-docker.pkg.dev/castai-hub/library/castai-pdb-controller:latest
+            ghcr.io/castai/images/castai-pdb-controller:${{ steps.version.outputs.tag }}
+            ghcr.io/castai/images/castai-pdb-controller:latest
 
   release-helm-chart:
     needs: build-and-push-image
