@@ -80,7 +80,8 @@ func setRolloutSupportOn(client dynamic.Interface) {
 func suspendRolloutSupport() {
 	rolloutSupportMu.Lock()
 	defer rolloutSupportMu.Unlock()
-	rolloutDynamicClient = nil
+	// Keep the dynamic client for direct Get/List (name-collision checks, GC).
+	// Informer handlers stay gated on getRolloutSupport(), which requires mode On.
 	rolloutSupportMode = rolloutModeSuspended
 }
 
@@ -89,6 +90,22 @@ func getRolloutSupport() (dynamic.Interface, bool) {
 	rolloutSupportMu.RLock()
 	defer rolloutSupportMu.RUnlock()
 	return rolloutDynamicClient, rolloutSupportMode == rolloutModeOn
+}
+
+// getRolloutLookupClient returns the dynamic client for direct Get/List when Rollouts
+// are On or Suspended (CRD known / previously enabled). Informer handlers must not use this.
+func getRolloutLookupClient() (dynamic.Interface, bool) {
+	rolloutSupportMu.RLock()
+	defer rolloutSupportMu.RUnlock()
+	if rolloutDynamicClient == nil {
+		return nil, false
+	}
+	switch rolloutSupportMode {
+	case rolloutModeOn, rolloutModeSuspended:
+		return rolloutDynamicClient, true
+	default:
+		return nil, false
+	}
 }
 
 func getRolloutSupportMode() rolloutMode {
@@ -337,7 +354,7 @@ func maybeStartRolloutInformer(ctx context.Context, clientset kubernetes.Interfa
 }
 
 func listRollouts(ctx context.Context, namespace string) ([]*rolloutWorkload, error) {
-	dyn, ok := getRolloutSupport()
+	dyn, ok := getRolloutLookupClient()
 	if !ok || dyn == nil {
 		return nil, nil
 	}
@@ -359,7 +376,7 @@ func listRollouts(ctx context.Context, namespace string) ([]*rolloutWorkload, er
 }
 
 func getRollout(ctx context.Context, namespace, name string) (*rolloutWorkload, error) {
-	dyn, ok := getRolloutSupport()
+	dyn, ok := getRolloutLookupClient()
 	gvr := getRolloutGVR()
 	if !ok || dyn == nil {
 		return nil, apierrors.NewNotFound(gvr.GroupResource(), name)

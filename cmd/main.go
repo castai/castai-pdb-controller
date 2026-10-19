@@ -437,6 +437,14 @@ func pdbSpecNeedsUpdate(existing, desired *policyv1.PodDisruptionBudgetSpec) boo
 
 // updateExistingPDB updates an existing castai PDB with new configuration
 func updateExistingPDB(ctx context.Context, clientset kubernetes.Interface, existingPDB *policyv1.PodDisruptionBudget, workloadAnnotations map[string]string, replicas *int32, namespace, name string, obj interface{}) {
+	kind := "Workload"
+	if wv, ok := asWorkloadView(obj); ok {
+		kind = wv.kind
+		if skipPDBForNameConflict(ctx, clientset, namespace, name, kind) {
+			return
+		}
+	}
+
 	if deleteCastaiPDBIfUnderReplicated(ctx, clientset, namespace, name, replicas) {
 		return
 	}
@@ -1300,6 +1308,12 @@ func createPDBForWorkload(ctx context.Context, clientset kubernetes.Interface, o
 	workloadAnnotations := wv.annotations
 	podTemplateLabels := wv.podTemplateLabels
 
+	// PDB names are castai-<name>-pdb (kind-agnostic). Check collisions before any
+	// under-replicated delete so we never remove another kind's PDB.
+	if skipPDBForNameConflict(ctx, clientset, namespace, name, wv.kind) {
+		return
+	}
+
 	if deleteCastaiPDBIfUnderReplicated(ctx, clientset, namespace, name, replicas) {
 		return
 	}
@@ -1320,14 +1334,6 @@ func createPDBForWorkload(ctx context.Context, clientset kubernetes.Interface, o
 		if wv.kind == "Rollout" {
 			logWarnf("Skipping PDB for Rollout %s/%s: empty spec.selector (workloadRef-based Rollouts are not supported)", namespace, name)
 		}
-		return
-	}
-
-	// PDB names are castai-<name>-pdb (kind-agnostic). Refuse to manage when multiple
-	// workload kinds share the name so we do not flip ownership of one PDB.
-	if others := conflictingWorkloadKinds(ctx, clientset, namespace, name, wv.kind); len(others) > 0 {
-		logWarnf("Skipping PDB management for %s %s/%s: same name also used by %v; rename one workload or manage its PDB manually",
-			wv.kind, namespace, name, others)
 		return
 	}
 
@@ -1612,15 +1618,22 @@ func deletePDBForWorkload(ctx context.Context, clientset kubernetes.Interface, o
 	}
 	namespace, name := wv.namespace, wv.name
 
-	// If another kind still uses this name, do not delete castai-<name>-pdb — it may belong to them.
-	if others := conflictingWorkloadKinds(ctx, clientset, namespace, name, wv.kind); len(others) > 0 {
+	// If another kind still uses this name (or we cannot tell), do not delete
+	// castai-<name>-pdb — it may belong to them.
+	others, err := conflictingWorkloadKinds(ctx, clientset, namespace, name, wv.kind)
+	if err != nil {
+		logWarnf("Not deleting PDB castai-%s-pdb after %s %s/%s removal: cannot confirm name uniqueness: %v",
+			name, wv.kind, namespace, name, err)
+		return
+	}
+	if len(others) > 0 {
 		logWarnf("Not deleting PDB castai-%s-pdb after %s %s/%s removal: %v still exist with the same name",
 			name, wv.kind, namespace, name, others)
 		return
 	}
 
 	pdbName := fmt.Sprintf("castai-%s-pdb", name)
-	err := clientset.PolicyV1().PodDisruptionBudgets(namespace).Delete(ctx, pdbName, metav1.DeleteOptions{})
+	err = clientset.PolicyV1().PodDisruptionBudgets(namespace).Delete(ctx, pdbName, metav1.DeleteOptions{})
 	if err != nil {
 		if apierrors.IsNotFound(err) {
 			logInfof("PDB %s/%s not found, nothing to delete", namespace, pdbName)
@@ -1632,15 +1645,34 @@ func deletePDBForWorkload(ctx context.Context, clientset kubernetes.Interface, o
 	}
 }
 
+// skipPDBForNameConflict logs and returns true when PDB create/update must be skipped
+// due to a same-name owner of another kind, or when conflict checks fail indeterminately.
+func skipPDBForNameConflict(ctx context.Context, clientset kubernetes.Interface, namespace, name, kind string) bool {
+	others, err := conflictingWorkloadKinds(ctx, clientset, namespace, name, kind)
+	if err != nil {
+		logWarnf("Skipping PDB management for %s %s/%s: cannot confirm name uniqueness: %v",
+			kind, namespace, name, err)
+		return true
+	}
+	if len(others) > 0 {
+		logWarnf("Skipping PDB management for %s %s/%s: same name also used by %v; rename one workload or manage its PDB manually",
+			kind, namespace, name, others)
+		return true
+	}
+	return false
+}
+
 // conflictingWorkloadKinds returns other managed kinds that share namespace/name with selfKind.
-func conflictingWorkloadKinds(ctx context.Context, clientset kubernetes.Interface, namespace, name, selfKind string) []string {
+// A non-nil error means the check was indeterminate (timeout, RBAC, suspended without
+// lookup client, etc.); callers must skip PDB mutations rather than assume no conflict.
+func conflictingWorkloadKinds(ctx context.Context, clientset kubernetes.Interface, namespace, name, selfKind string) ([]string, error) {
 	others := make([]string, 0, 2)
 	if selfKind != "Deployment" {
 		_, err := clientset.AppsV1().Deployments(namespace).Get(ctx, name, metav1.GetOptions{})
 		if err == nil {
 			others = append(others, "Deployment")
 		} else if !apierrors.IsNotFound(err) {
-			logWarnf("Failed to check Deployment %s/%s for name collision: %v", namespace, name, err)
+			return nil, fmt.Errorf("Deployment %s/%s: %w", namespace, name, err)
 		}
 	}
 	if selfKind != "StatefulSet" {
@@ -1648,19 +1680,23 @@ func conflictingWorkloadKinds(ctx context.Context, clientset kubernetes.Interfac
 		if err == nil {
 			others = append(others, "StatefulSet")
 		} else if !apierrors.IsNotFound(err) {
-			logWarnf("Failed to check StatefulSet %s/%s for name collision: %v", namespace, name, err)
+			return nil, fmt.Errorf("StatefulSet %s/%s: %w", namespace, name, err)
 		}
 	}
 	if selfKind != "Rollout" {
-		if mode := getRolloutSupportMode(); mode == rolloutModeOn {
+		mode := getRolloutSupportMode()
+		if mode == rolloutModeOn || mode == rolloutModeSuspended {
+			if _, ok := getRolloutLookupClient(); !ok {
+				return nil, fmt.Errorf("Rollout support is %v but lookup client unavailable", mode)
+			}
 			if _, err := getRollout(ctx, namespace, name); err == nil {
 				others = append(others, "Rollout")
 			} else if !apierrors.IsNotFound(err) {
-				logWarnf("Failed to check Rollout %s/%s for name collision: %v", namespace, name, err)
+				return nil, fmt.Errorf("Rollout %s/%s: %w", namespace, name, err)
 			}
 		}
 	}
-	return others
+	return others, nil
 }
 
 // Deletes orphaned PodDisruptionBudgets that no longer have an associated Deployment,
@@ -1693,14 +1729,17 @@ func garbageCollectOrphanedPDBs(ctx context.Context, clientset kubernetes.Interf
 		case rolloutModeOn:
 			rollout, errRollout = getRollout(ctx, pdb.Namespace, workloadName)
 		case rolloutModeSuspended:
-			// Cannot confirm Rollout absence. If Deploy/STS are also missing, skip
-			// orphan deletion rather than deleting PDBs that may still back Rollouts.
-			if apierrors.IsNotFound(errDep) && apierrors.IsNotFound(errSts) {
+			// Prefer a direct Get when the lookup client was retained; otherwise refuse
+			// orphan deletion when Deploy/STS are also missing.
+			if _, ok := getRolloutLookupClient(); ok {
+				rollout, errRollout = getRollout(ctx, pdb.Namespace, workloadName)
+			} else if apierrors.IsNotFound(errDep) && apierrors.IsNotFound(errSts) {
 				logDebugf("Skipping GC for PDB %s/%s: Rollout support is suspended; cannot confirm Rollout %q absence",
 					pdb.Namespace, pdb.Name, workloadName)
 				continue
+			} else {
+				errRollout = apierrors.NewNotFound(getRolloutGVR().GroupResource(), workloadName)
 			}
-			errRollout = apierrors.NewNotFound(getRolloutGVR().GroupResource(), workloadName)
 		default:
 			errRollout = apierrors.NewNotFound(getRolloutGVR().GroupResource(), workloadName)
 		}
@@ -1762,7 +1801,11 @@ func garbageCollectOrphanedPDBs(ctx context.Context, clientset kubernetes.Interf
 				podTemplateLabels: rollout.PodTemplateLabels,
 			})
 		}
-		replicas := pickGCWorkloadReplicas(pdb, workloadName, candidates)
+		replicas, ok := pickGCWorkloadReplicas(pdb, workloadName, candidates)
+		if !ok {
+			// Ambiguous owner — do not guess a replica count.
+			continue
+		}
 		if replicas == nil || *replicas < 2 {
 			err := clientset.PolicyV1().PodDisruptionBudgets(pdb.Namespace).Delete(ctx, pdb.Name, metav1.DeleteOptions{})
 			if err != nil {
@@ -1788,13 +1831,14 @@ type gcWorkloadCandidate struct {
 
 // pickGCWorkloadReplicas chooses which same-named workload's replica count to use for
 // under-replication GC. Prefer an exact selector match or PDB coverage of pod template labels.
+// ok=false means the owner is ambiguous and under-replication GC must be skipped.
 // PDB is passed by value to avoid depending on range-loop variable lifetime.
-func pickGCWorkloadReplicas(pdb policyv1.PodDisruptionBudget, workloadName string, candidates []gcWorkloadCandidate) *int32 {
+func pickGCWorkloadReplicas(pdb policyv1.PodDisruptionBudget, workloadName string, candidates []gcWorkloadCandidate) (replicas *int32, ok bool) {
 	if len(candidates) == 0 {
-		return nil
+		return nil, false
 	}
 	if len(candidates) == 1 {
-		return candidates[0].replicas
+		return candidates[0].replicas, true
 	}
 
 	exact := make([]gcWorkloadCandidate, 0, len(candidates))
@@ -1805,12 +1849,7 @@ func pickGCWorkloadReplicas(pdb policyv1.PodDisruptionBudget, workloadName strin
 			exact = append(exact, c)
 			continue
 		}
-		covers, err := pdbCoversPodTemplate(&pdb, c.podTemplateLabels)
-		if err != nil {
-			logWarnf("PDB %s/%s: failed to evaluate coverage for %s %q during GC: %v",
-				pdb.Namespace, pdb.Name, c.kind, workloadName, err)
-			continue
-		}
+		covers, _ := pdbCoversPodTemplate(&pdb, c.podTemplateLabels)
 		if covers {
 			covered = append(covered, c)
 		}
@@ -1824,19 +1863,19 @@ func pickGCWorkloadReplicas(pdb policyv1.PodDisruptionBudget, workloadName strin
 			logWarnf("PDB %s/%s exactly matches multiple workloads named %q (%v); using highest replica count",
 				pdb.Namespace, pdb.Name, workloadName, gcCandidateKinds(exact))
 		}
-		return maxReplicasAmong(exact)
+		return maxReplicasAmong(exact), true
 	}
 	if len(covered) > 0 {
 		if len(covered) > 1 {
 			logWarnf("PDB %s/%s covers multiple workloads named %q (%v); using highest replica count",
 				pdb.Namespace, pdb.Name, workloadName, gcCandidateKinds(covered))
 		}
-		return maxReplicasAmong(covered)
+		return maxReplicasAmong(covered), true
 	}
 
-	logWarnf("PDB %s/%s: multiple workloads named %q exist (%v) without a clear selector match; using highest replica count",
+	logWarnf("PDB %s/%s: multiple workloads named %q exist (%v) without a clear selector match; skipping under-replication GC",
 		pdb.Namespace, pdb.Name, workloadName, gcCandidateKinds(candidates))
-	return maxReplicasAmong(candidates)
+	return nil, false
 }
 
 func gcCandidateKinds(cands []gcWorkloadCandidate) []string {
@@ -2016,7 +2055,18 @@ func scanAllPDBsForPoorConfig(ctx context.Context, clientset kubernetes.Interfac
 		logErrorf("Failed to list PDBs for audit: %v", err)
 		return
 	}
-	for _, pdb := range pdbs.Items {
+
+	// List workloads once per namespace (not once per PDB) to avoid N API calls.
+	type nsWorkloads struct {
+		deployments  []appsv1.Deployment
+		statefulsets []appsv1.StatefulSet
+		rollouts     []*rolloutWorkload
+		loaded       bool
+	}
+	byNS := make(map[string]*nsWorkloads)
+
+	for i := range pdbs.Items {
+		pdb := &pdbs.Items[i]
 		if pdb.Spec.Selector == nil {
 			continue
 		}
@@ -2026,88 +2076,92 @@ func scanAllPDBsForPoorConfig(ctx context.Context, clientset kubernetes.Interfac
 			continue
 		}
 
-		// Check Deployments
-		deployments, err := clientset.AppsV1().Deployments(pdb.Namespace).List(ctx, metav1.ListOptions{})
-		if err != nil {
-			logErrorf("Failed to list Deployments in namespace %s: %v", pdb.Namespace, err)
-		} else {
-			for _, deploy := range deployments.Items {
-				// Skip if bypass annotation is set
-				if deploy.Annotations != nil && deploy.Annotations[annotationBypass] == "true" {
-					continue
+		cache, ok := byNS[pdb.Namespace]
+		if !ok {
+			cache = &nsWorkloads{}
+			byNS[pdb.Namespace] = cache
+		}
+		if !cache.loaded {
+			if deps, err := clientset.AppsV1().Deployments(pdb.Namespace).List(ctx, metav1.ListOptions{}); err != nil {
+				logErrorf("Failed to list Deployments in namespace %s: %v", pdb.Namespace, err)
+			} else {
+				cache.deployments = deps.Items
+			}
+			if stss, err := clientset.AppsV1().StatefulSets(pdb.Namespace).List(ctx, metav1.ListOptions{}); err != nil {
+				logErrorf("Failed to list StatefulSets in namespace %s: %v", pdb.Namespace, err)
+			} else {
+				cache.statefulsets = stss.Items
+			}
+			if rollouts, err := listRollouts(ctx, pdb.Namespace); err != nil {
+				logErrorf("Failed to list Rollouts in namespace %s: %v", pdb.Namespace, err)
+			} else {
+				cache.rollouts = rollouts
+			}
+			cache.loaded = true
+		}
+
+		for j := range cache.deployments {
+			deploy := &cache.deployments[j]
+			if deploy.Annotations != nil && deploy.Annotations[annotationBypass] == "true" {
+				continue
+			}
+			if deploy.Spec.Selector == nil {
+				continue
+			}
+			workloadSelector, err := metav1.LabelSelectorAsSelector(deploy.Spec.Selector)
+			if err != nil {
+				logWarnf("Invalid selector for Deployment %s/%s: %v", deploy.Namespace, deploy.Name, err)
+				continue
+			}
+			if pdbSelector.String() == workloadSelector.String() {
+				replicas := int32(1)
+				if deploy.Spec.Replicas != nil {
+					replicas = *deploy.Spec.Replicas
 				}
-				if deploy.Spec.Selector == nil {
-					continue
-				}
-				workloadSelector, err := metav1.LabelSelectorAsSelector(deploy.Spec.Selector)
-				if err != nil {
-					logWarnf("Invalid selector for Deployment %s/%s: %v", deploy.Namespace, deploy.Name, err)
-					continue
-				}
-				// Compare selectors for semantic equivalence
-				if pdbSelector.String() == workloadSelector.String() {
-					replicas := int32(1)
-					if deploy.Spec.Replicas != nil {
-						replicas = *deploy.Spec.Replicas
-					}
-					logAndFixPoorPDBConfig(ctx, clientset, &pdb, deploy.Name, replicas, pdb.Namespace, &deploy)
-				}
+				logAndFixPoorPDBConfig(ctx, clientset, pdb, deploy.Name, replicas, pdb.Namespace, deploy)
 			}
 		}
 
-		// Check StatefulSets
-		statefulsets, err := clientset.AppsV1().StatefulSets(pdb.Namespace).List(ctx, metav1.ListOptions{})
-		if err != nil {
-			logErrorf("Failed to list StatefulSets in namespace %s: %v", pdb.Namespace, err)
-		} else {
-			for _, sts := range statefulsets.Items {
-				// Skip if bypass annotation is set
-				if sts.Annotations != nil && sts.Annotations[annotationBypass] == "true" {
-					continue
+		for j := range cache.statefulsets {
+			sts := &cache.statefulsets[j]
+			if sts.Annotations != nil && sts.Annotations[annotationBypass] == "true" {
+				continue
+			}
+			if sts.Spec.Selector == nil {
+				continue
+			}
+			workloadSelector, err := metav1.LabelSelectorAsSelector(sts.Spec.Selector)
+			if err != nil {
+				logWarnf("Invalid selector for StatefulSet %s/%s: %v", sts.Namespace, sts.Name, err)
+				continue
+			}
+			if pdbSelector.String() == workloadSelector.String() {
+				replicas := int32(1)
+				if sts.Spec.Replicas != nil {
+					replicas = *sts.Spec.Replicas
 				}
-				if sts.Spec.Selector == nil {
-					continue
-				}
-				workloadSelector, err := metav1.LabelSelectorAsSelector(sts.Spec.Selector)
-				if err != nil {
-					logWarnf("Invalid selector for StatefulSet %s/%s: %v", sts.Namespace, sts.Name, err)
-					continue
-				}
-				// Compare selectors for semantic equivalence
-				if pdbSelector.String() == workloadSelector.String() {
-					replicas := int32(1)
-					if sts.Spec.Replicas != nil {
-						replicas = *sts.Spec.Replicas
-					}
-					logAndFixPoorPDBConfig(ctx, clientset, &pdb, sts.Name, replicas, pdb.Namespace, &sts)
-				}
+				logAndFixPoorPDBConfig(ctx, clientset, pdb, sts.Name, replicas, pdb.Namespace, sts)
 			}
 		}
 
-		// Check Rollouts (no-op when CRD is not installed / support disabled)
-		rollouts, err := listRollouts(ctx, pdb.Namespace)
-		if err != nil {
-			logErrorf("Failed to list Rollouts in namespace %s: %v", pdb.Namespace, err)
-		} else {
-			for _, r := range rollouts {
-				if r.Annotations != nil && r.Annotations[annotationBypass] == "true" {
-					continue
+		for _, r := range cache.rollouts {
+			if r.Annotations != nil && r.Annotations[annotationBypass] == "true" {
+				continue
+			}
+			if r.Selector == nil {
+				continue
+			}
+			workloadSelector, err := metav1.LabelSelectorAsSelector(r.Selector)
+			if err != nil {
+				logWarnf("Invalid selector for Rollout %s/%s: %v", r.Namespace, r.Name, err)
+				continue
+			}
+			if pdbSelector.String() == workloadSelector.String() {
+				replicas := int32(1)
+				if r.Replicas != nil {
+					replicas = *r.Replicas
 				}
-				if r.Selector == nil {
-					continue
-				}
-				workloadSelector, err := metav1.LabelSelectorAsSelector(r.Selector)
-				if err != nil {
-					logWarnf("Invalid selector for Rollout %s/%s: %v", r.Namespace, r.Name, err)
-					continue
-				}
-				if pdbSelector.String() == workloadSelector.String() {
-					replicas := int32(1)
-					if r.Replicas != nil {
-						replicas = *r.Replicas
-					}
-					logAndFixPoorPDBConfig(ctx, clientset, &pdb, r.Name, replicas, pdb.Namespace, r)
-				}
+				logAndFixPoorPDBConfig(ctx, clientset, pdb, r.Name, replicas, pdb.Namespace, r)
 			}
 		}
 	}

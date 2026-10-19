@@ -290,7 +290,7 @@ func TestPickGCWorkloadReplicas_prefersSelectorMatch(t *testing.T) {
 			Selector: &metav1.LabelSelector{MatchLabels: map[string]string{"tier": "api", "app": "rollout-app"}},
 		},
 	}
-	got := pickGCWorkloadReplicas(pdb, "shared", []gcWorkloadCandidate{
+	got, ok := pickGCWorkloadReplicas(pdb, "shared", []gcWorkloadCandidate{
 		{
 			kind:              "Deployment",
 			replicas:          &one,
@@ -307,8 +307,8 @@ func TestPickGCWorkloadReplicas_prefersSelectorMatch(t *testing.T) {
 			podTemplateLabels: map[string]string{"app": "rollout-app", "tier": "api"},
 		},
 	})
-	if got == nil || *got != 3 {
-		t.Fatalf("expected Rollout replicas=3, got %v", got)
+	if !ok || got == nil || *got != 3 {
+		t.Fatalf("expected Rollout replicas=3 ok=true, got %v ok=%v", got, ok)
 	}
 }
 
@@ -377,6 +377,133 @@ func TestCreatePDBForWorkload_skipsOnNameCollision(t *testing.T) {
 	}
 }
 
+func TestCreatePDBForWorkload_collisionGuardBeforeUnderReplicatedDelete(t *testing.T) {
+	resetDefaultPDBConfig()
+	t.Cleanup(resetDefaultPDBConfig)
+	t.Cleanup(func() { setRolloutSupport(nil, false) })
+
+	one := int32(1)
+	// Existing PDB for the multi-replica Rollout.
+	pdb := &policyv1.PodDisruptionBudget{
+		ObjectMeta: metav1.ObjectMeta{Name: "castai-shared-pdb", Namespace: "default"},
+		Spec: policyv1.PodDisruptionBudgetSpec{
+			MinAvailable: &intstr.IntOrString{Type: intstr.Int, IntVal: 1},
+			Selector:     &metav1.LabelSelector{MatchLabels: map[string]string{"app": "ro"}},
+		},
+	}
+	// Under-replicated Deployment with the same name must not delete the Rollout's PDB.
+	dep := &appsv1.Deployment{
+		ObjectMeta: metav1.ObjectMeta{Name: "shared", Namespace: "default"},
+		Spec: appsv1.DeploymentSpec{
+			Replicas: &one,
+			Selector: &metav1.LabelSelector{MatchLabels: map[string]string{"app": "dep"}},
+			Template: corev1.PodTemplateSpec{ObjectMeta: metav1.ObjectMeta{Labels: map[string]string{"app": "dep"}}},
+		},
+	}
+	clientset := fake.NewSimpleClientset(pdb, dep)
+	u := newUnstructuredRollout("default", "shared", 3,
+		map[string]string{"app": "ro"},
+		map[string]string{"app": "ro"},
+		3, 3,
+	)
+	dyn := dynamicfake.NewSimpleDynamicClientWithCustomListKinds(
+		runtime.NewScheme(),
+		map[schema.GroupVersionResource]string{getRolloutGVR(): "RolloutList"},
+		u,
+	)
+	setRolloutSupport(dyn, true)
+
+	createPDBForWorkload(context.Background(), clientset, dep)
+	if _, err := clientset.PolicyV1().PodDisruptionBudgets("default").Get(context.Background(), "castai-shared-pdb", metav1.GetOptions{}); err != nil {
+		t.Fatalf("PDB belonging to same-named Rollout must not be deleted by under-replicated Deploy: %v", err)
+	}
+}
+
+func TestUpdateExistingPDB_skipsOnNameCollision(t *testing.T) {
+	resetDefaultPDBConfig()
+	t.Cleanup(resetDefaultPDBConfig)
+	t.Cleanup(func() { setRolloutSupport(nil, false) })
+
+	two := int32(2)
+	existing := &policyv1.PodDisruptionBudget{
+		ObjectMeta: metav1.ObjectMeta{Name: "castai-shared-pdb", Namespace: "default"},
+		Spec: policyv1.PodDisruptionBudgetSpec{
+			Selector:     &metav1.LabelSelector{MatchLabels: map[string]string{"app": "ro"}},
+			MinAvailable: &intstr.IntOrString{Type: intstr.Int, IntVal: 1},
+		},
+	}
+	dep := &appsv1.Deployment{
+		ObjectMeta: metav1.ObjectMeta{Name: "shared", Namespace: "default"},
+		Spec: appsv1.DeploymentSpec{
+			Replicas: &two,
+			Selector: &metav1.LabelSelector{MatchLabels: map[string]string{"app": "dep"}},
+			Template: corev1.PodTemplateSpec{ObjectMeta: metav1.ObjectMeta{Labels: map[string]string{"app": "dep"}}},
+		},
+	}
+	clientset := fake.NewSimpleClientset(existing, dep)
+	u := newUnstructuredRollout("default", "shared", 2,
+		map[string]string{"app": "ro"},
+		map[string]string{"app": "ro"},
+		2, 2,
+	)
+	dyn := dynamicfake.NewSimpleDynamicClientWithCustomListKinds(
+		runtime.NewScheme(),
+		map[schema.GroupVersionResource]string{getRolloutGVR(): "RolloutList"},
+		u,
+	)
+	setRolloutSupport(dyn, true)
+
+	rw, err := parseRolloutWorkload(u)
+	if err != nil {
+		t.Fatal(err)
+	}
+	rw.Annotations = map[string]string{annotationMinAvailable: "2"}
+	updateExistingPDB(context.Background(), clientset, existing, rw.Annotations, &two, "default", "shared", rw)
+
+	got, err := clientset.PolicyV1().PodDisruptionBudgets("default").Get(context.Background(), "castai-shared-pdb", metav1.GetOptions{})
+	if err != nil {
+		t.Fatalf("get PDB: %v", err)
+	}
+	if got.Spec.MinAvailable == nil || got.Spec.MinAvailable.IntVal != 1 {
+		t.Fatalf("expected PDB left unchanged on name collision, got %#v", got.Spec.MinAvailable)
+	}
+}
+
+func TestConflictingWorkloadKinds_suspendedStillDetectsRollout(t *testing.T) {
+	t.Cleanup(func() { setRolloutSupport(nil, false) })
+
+	dep := &appsv1.Deployment{
+		ObjectMeta: metav1.ObjectMeta{Name: "shared", Namespace: "default"},
+	}
+	clientset := fake.NewSimpleClientset(dep)
+	u := newUnstructuredRollout("default", "shared", 2,
+		map[string]string{"app": "ro"},
+		map[string]string{"app": "ro"},
+		2, 2,
+	)
+	dyn := dynamicfake.NewSimpleDynamicClientWithCustomListKinds(
+		runtime.NewScheme(),
+		map[schema.GroupVersionResource]string{getRolloutGVR(): "RolloutList"},
+		u,
+	)
+	setRolloutSupportOn(dyn)
+	suspendRolloutSupport()
+
+	others, err := conflictingWorkloadKinds(context.Background(), clientset, "default", "shared", "Deployment")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if len(others) != 1 || others[0] != "Rollout" {
+		t.Fatalf("expected Rollout conflict while suspended, got %v", others)
+	}
+	if mode := getRolloutSupportMode(); mode != rolloutModeSuspended {
+		t.Fatalf("expected suspended mode, got %v", mode)
+	}
+	if _, ok := getRolloutSupport(); ok {
+		t.Fatal("informer support must be disabled while suspended")
+	}
+}
+
 func TestDeletePDBForWorkload_unwrapsTombstone(t *testing.T) {
 	resetDefaultPDBConfig()
 	t.Cleanup(resetDefaultPDBConfig)
@@ -425,7 +552,7 @@ func TestPickGCWorkloadReplicas_prefersExactOverCoverAndMaxReplicas(t *testing.T
 		},
 	}
 	// Coverage-only under-replicated Deploy vs exact-match multi-replica Rollout.
-	got := pickGCWorkloadReplicas(pdb, "shared", []gcWorkloadCandidate{
+	got, ok := pickGCWorkloadReplicas(pdb, "shared", []gcWorkloadCandidate{
 		{
 			kind: "Deployment", replicas: &one,
 			selector:          &metav1.LabelSelector{MatchLabels: map[string]string{"app": "shared", "extra": "x"}},
@@ -437,8 +564,35 @@ func TestPickGCWorkloadReplicas_prefersExactOverCoverAndMaxReplicas(t *testing.T
 			podTemplateLabels: map[string]string{"app": "shared"},
 		},
 	})
-	if got == nil || *got != 3 {
-		t.Fatalf("expected exact-match Rollout replicas=3, got %v", got)
+	if !ok || got == nil || *got != 3 {
+		t.Fatalf("expected exact-match Rollout replicas=3 ok=true, got %v ok=%v", got, ok)
+	}
+}
+
+func TestPickGCWorkloadReplicas_skipsWhenNoSelectorMatch(t *testing.T) {
+	t.Parallel()
+	one := int32(1)
+	three := int32(3)
+	pdb := policyv1.PodDisruptionBudget{
+		ObjectMeta: metav1.ObjectMeta{Name: "castai-shared-pdb", Namespace: "default"},
+		Spec: policyv1.PodDisruptionBudgetSpec{
+			Selector: &metav1.LabelSelector{MatchLabels: map[string]string{"app": "other"}},
+		},
+	}
+	got, ok := pickGCWorkloadReplicas(pdb, "shared", []gcWorkloadCandidate{
+		{
+			kind: "Deployment", replicas: &one,
+			selector:          &metav1.LabelSelector{MatchLabels: map[string]string{"app": "dep"}},
+			podTemplateLabels: map[string]string{"app": "dep"},
+		},
+		{
+			kind: "Rollout", replicas: &three,
+			selector:          &metav1.LabelSelector{MatchLabels: map[string]string{"app": "ro"}},
+			podTemplateLabels: map[string]string{"app": "ro"},
+		},
+	})
+	if ok || got != nil {
+		t.Fatalf("expected skip (ok=false) when no selector match, got %v ok=%v", got, ok)
 	}
 }
 
