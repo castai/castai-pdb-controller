@@ -18,6 +18,7 @@ import (
 	dynamicfake "k8s.io/client-go/dynamic/fake"
 	"k8s.io/client-go/kubernetes/fake"
 	clienttesting "k8s.io/client-go/testing"
+	"k8s.io/client-go/tools/cache"
 )
 
 func TestParseRolloutWorkload(t *testing.T) {
@@ -319,6 +320,125 @@ func TestInt64ToInt32_overflow(t *testing.T) {
 	got, err := int64ToInt32(3, "spec.replicas")
 	if err != nil || got != 3 {
 		t.Fatalf("got %d err=%v", got, err)
+	}
+}
+
+func TestCreatePDBForWorkload_rolloutSkipsNilSelector(t *testing.T) {
+	resetDefaultPDBConfig()
+	t.Cleanup(resetDefaultPDBConfig)
+	two := int32(2)
+	rw := &rolloutWorkload{
+		Namespace: "default", Name: "ref-ro", Replicas: &two,
+		Selector:      nil, // workloadRef-style
+		ReadyReplicas: 2, AvailableReplicas: 2,
+	}
+	clientset := fake.NewSimpleClientset()
+	createPDBForWorkload(context.Background(), clientset, rw)
+	if _, err := clientset.PolicyV1().PodDisruptionBudgets("default").Get(context.Background(), "castai-ref-ro-pdb", metav1.GetOptions{}); !apierrors.IsNotFound(err) {
+		t.Fatalf("expected no PDB for nil-selector Rollout, got err=%v", err)
+	}
+}
+
+func TestCreatePDBForWorkload_skipsOnNameCollision(t *testing.T) {
+	resetDefaultPDBConfig()
+	t.Cleanup(resetDefaultPDBConfig)
+	t.Cleanup(func() { setRolloutSupport(nil, false) })
+
+	two := int32(2)
+	dep := &appsv1.Deployment{
+		ObjectMeta: metav1.ObjectMeta{Name: "shared", Namespace: "default"},
+		Spec: appsv1.DeploymentSpec{
+			Replicas: &two,
+			Selector: &metav1.LabelSelector{MatchLabels: map[string]string{"app": "dep"}},
+			Template: corev1.PodTemplateSpec{ObjectMeta: metav1.ObjectMeta{Labels: map[string]string{"app": "dep"}}},
+		},
+		Status: appsv1.DeploymentStatus{ReadyReplicas: 2, AvailableReplicas: 2},
+	}
+	clientset := fake.NewSimpleClientset(dep)
+	u := newUnstructuredRollout("default", "shared", 2,
+		map[string]string{"app": "ro"},
+		map[string]string{"app": "ro"},
+		2, 2,
+	)
+	dyn := dynamicfake.NewSimpleDynamicClientWithCustomListKinds(
+		runtime.NewScheme(),
+		map[schema.GroupVersionResource]string{getRolloutGVR(): "RolloutList"},
+		u,
+	)
+	setRolloutSupport(dyn, true)
+
+	rw, err := parseRolloutWorkload(u)
+	if err != nil {
+		t.Fatal(err)
+	}
+	createPDBForWorkload(context.Background(), clientset, rw)
+	if _, err := clientset.PolicyV1().PodDisruptionBudgets("default").Get(context.Background(), "castai-shared-pdb", metav1.GetOptions{}); !apierrors.IsNotFound(err) {
+		t.Fatalf("expected skip on Deploy+Rollout name collision, got err=%v", err)
+	}
+}
+
+func TestDeletePDBForWorkload_unwrapsTombstone(t *testing.T) {
+	resetDefaultPDBConfig()
+	t.Cleanup(resetDefaultPDBConfig)
+
+	pdb := &policyv1.PodDisruptionBudget{
+		ObjectMeta: metav1.ObjectMeta{Name: "castai-web-pdb", Namespace: "default"},
+		Spec:       policyv1.PodDisruptionBudgetSpec{Selector: &metav1.LabelSelector{MatchLabels: map[string]string{"app": "web"}}},
+	}
+	clientset := fake.NewSimpleClientset(pdb)
+	dep := &appsv1.Deployment{ObjectMeta: metav1.ObjectMeta{Name: "web", Namespace: "default"}}
+	deletePDBForWorkload(context.Background(), clientset, cache.DeletedFinalStateUnknown{Obj: dep})
+	if _, err := clientset.PolicyV1().PodDisruptionBudgets("default").Get(context.Background(), "castai-web-pdb", metav1.GetOptions{}); !apierrors.IsNotFound(err) {
+		t.Fatalf("expected PDB deleted via tombstone unwrap, got err=%v", err)
+	}
+}
+
+func TestGarbageCollectOrphanedPDBs_skipsWhenRolloutSupportSuspended(t *testing.T) {
+	resetDefaultPDBConfig()
+	t.Cleanup(resetDefaultPDBConfig)
+	t.Cleanup(func() { setRolloutSupport(nil, false) })
+
+	pdb := &policyv1.PodDisruptionBudget{
+		ObjectMeta: metav1.ObjectMeta{Name: "castai-only-ro-pdb", Namespace: "default"},
+		Spec: policyv1.PodDisruptionBudgetSpec{
+			MinAvailable: &intstr.IntOrString{Type: intstr.Int, IntVal: 1},
+			Selector:     &metav1.LabelSelector{MatchLabels: map[string]string{"app": "only-ro"}},
+		},
+	}
+	clientset := fake.NewSimpleClientset(pdb)
+	suspendRolloutSupport()
+
+	garbageCollectOrphanedPDBs(context.Background(), clientset)
+	if _, err := clientset.PolicyV1().PodDisruptionBudgets("default").Get(context.Background(), "castai-only-ro-pdb", metav1.GetOptions{}); err != nil {
+		t.Fatalf("PDB must be kept while Rollout support is suspended: %v", err)
+	}
+}
+
+func TestPickGCWorkloadReplicas_prefersExactOverCoverAndMaxReplicas(t *testing.T) {
+	t.Parallel()
+	one := int32(1)
+	three := int32(3)
+	pdb := policyv1.PodDisruptionBudget{
+		ObjectMeta: metav1.ObjectMeta{Name: "castai-shared-pdb", Namespace: "default"},
+		Spec: policyv1.PodDisruptionBudgetSpec{
+			Selector: &metav1.LabelSelector{MatchLabels: map[string]string{"app": "shared"}},
+		},
+	}
+	// Coverage-only under-replicated Deploy vs exact-match multi-replica Rollout.
+	got := pickGCWorkloadReplicas(pdb, "shared", []gcWorkloadCandidate{
+		{
+			kind: "Deployment", replicas: &one,
+			selector:          &metav1.LabelSelector{MatchLabels: map[string]string{"app": "shared", "extra": "x"}},
+			podTemplateLabels: map[string]string{"app": "shared", "extra": "x"},
+		},
+		{
+			kind: "Rollout", replicas: &three,
+			selector:          &metav1.LabelSelector{MatchLabels: map[string]string{"app": "shared"}},
+			podTemplateLabels: map[string]string{"app": "shared"},
+		},
+	})
+	if got == nil || *got != 3 {
+		t.Fatalf("expected exact-match Rollout replicas=3, got %v", got)
 	}
 }
 

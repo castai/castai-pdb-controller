@@ -35,6 +35,7 @@ import (
 
 // workloadView is the common PDB-relevant surface for Deployments, StatefulSets, and Rollouts.
 type workloadView struct {
+	kind              string
 	namespace         string
 	name              string
 	replicas          *int32
@@ -45,9 +46,13 @@ type workloadView struct {
 }
 
 func asWorkloadView(obj interface{}) (workloadView, bool) {
+	if tombstone, ok := obj.(cache.DeletedFinalStateUnknown); ok {
+		obj = tombstone.Obj
+	}
 	switch w := obj.(type) {
 	case *appsv1.Deployment:
 		return workloadView{
+			kind:              "Deployment",
 			namespace:         w.Namespace,
 			name:              w.Name,
 			replicas:          w.Spec.Replicas,
@@ -58,6 +63,7 @@ func asWorkloadView(obj interface{}) (workloadView, bool) {
 		}, true
 	case *appsv1.StatefulSet:
 		return workloadView{
+			kind:              "StatefulSet",
 			namespace:         w.Namespace,
 			name:              w.Name,
 			replicas:          w.Spec.Replicas,
@@ -68,6 +74,7 @@ func asWorkloadView(obj interface{}) (workloadView, bool) {
 		}, true
 	case *rolloutWorkload:
 		return workloadView{
+			kind:              "Rollout",
 			namespace:         w.Namespace,
 			name:              w.Name,
 			replicas:          w.Replicas,
@@ -976,7 +983,7 @@ func runController(ctx context.Context, clientset *kubernetes.Clientset, restCon
 	dynClient, err := dynamic.NewForConfig(restConfig)
 	if err != nil {
 		logWarnf("Failed to create dynamic client for Rollout support: %v; skipping Rollout PDB management", err)
-		setRolloutSupport(nil, false)
+		setRolloutSupportOff()
 	} else {
 		rolloutSynced, stopRollouts = maybeStartRolloutInformer(ctx, clientset, dynClient)
 	}
@@ -1095,10 +1102,10 @@ func runController(ctx context.Context, clientset *kubernetes.Clientset, restCon
 		ok := cache.WaitForCacheSync(syncCtx.Done(), rolloutSynced)
 		cancel()
 		if !ok {
-			logWarnf("Timed out waiting for Rollout informer sync; disabling Rollout PDB management so Deployment/StatefulSet management continues")
-			// Disable first so in-flight handlers that check getRolloutSupport() no-op,
-			// then cancel the Rollout informer context so factory goroutines stop.
-			setRolloutSupport(nil, false)
+			logWarnf("Timed out waiting for Rollout informer sync; suspending Rollout PDB management so Deployment/StatefulSet management continues")
+			// Suspend (not off): GC must not treat Rollouts as absent/NotFound and
+			// orphan PDBs. Handlers no-op because getRolloutSupport() is false.
+			suspendRolloutSupport()
 			if stopRollouts != nil {
 				stopRollouts()
 			}
@@ -1310,6 +1317,17 @@ func createPDBForWorkload(ctx context.Context, clientset kubernetes.Interface, o
 	logDebugf("Workload %s/%s is NOT excluded", namespace, name)
 
 	if selector == nil {
+		if wv.kind == "Rollout" {
+			logWarnf("Skipping PDB for Rollout %s/%s: empty spec.selector (workloadRef-based Rollouts are not supported)", namespace, name)
+		}
+		return
+	}
+
+	// PDB names are castai-<name>-pdb (kind-agnostic). Refuse to manage when multiple
+	// workload kinds share the name so we do not flip ownership of one PDB.
+	if others := conflictingWorkloadKinds(ctx, clientset, namespace, name, wv.kind); len(others) > 0 {
+		logWarnf("Skipping PDB management for %s %s/%s: same name also used by %v; rename one workload or manage its PDB manually",
+			wv.kind, namespace, name, others)
 		return
 	}
 
@@ -1594,6 +1612,13 @@ func deletePDBForWorkload(ctx context.Context, clientset kubernetes.Interface, o
 	}
 	namespace, name := wv.namespace, wv.name
 
+	// If another kind still uses this name, do not delete castai-<name>-pdb — it may belong to them.
+	if others := conflictingWorkloadKinds(ctx, clientset, namespace, name, wv.kind); len(others) > 0 {
+		logWarnf("Not deleting PDB castai-%s-pdb after %s %s/%s removal: %v still exist with the same name",
+			name, wv.kind, namespace, name, others)
+		return
+	}
+
 	pdbName := fmt.Sprintf("castai-%s-pdb", name)
 	err := clientset.PolicyV1().PodDisruptionBudgets(namespace).Delete(ctx, pdbName, metav1.DeleteOptions{})
 	if err != nil {
@@ -1605,6 +1630,37 @@ func deletePDBForWorkload(ctx context.Context, clientset kubernetes.Interface, o
 	} else {
 		logInfof("Deleted PDB %s/%s", namespace, pdbName)
 	}
+}
+
+// conflictingWorkloadKinds returns other managed kinds that share namespace/name with selfKind.
+func conflictingWorkloadKinds(ctx context.Context, clientset kubernetes.Interface, namespace, name, selfKind string) []string {
+	others := make([]string, 0, 2)
+	if selfKind != "Deployment" {
+		_, err := clientset.AppsV1().Deployments(namespace).Get(ctx, name, metav1.GetOptions{})
+		if err == nil {
+			others = append(others, "Deployment")
+		} else if !apierrors.IsNotFound(err) {
+			logWarnf("Failed to check Deployment %s/%s for name collision: %v", namespace, name, err)
+		}
+	}
+	if selfKind != "StatefulSet" {
+		_, err := clientset.AppsV1().StatefulSets(namespace).Get(ctx, name, metav1.GetOptions{})
+		if err == nil {
+			others = append(others, "StatefulSet")
+		} else if !apierrors.IsNotFound(err) {
+			logWarnf("Failed to check StatefulSet %s/%s for name collision: %v", namespace, name, err)
+		}
+	}
+	if selfKind != "Rollout" {
+		if mode := getRolloutSupportMode(); mode == rolloutModeOn {
+			if _, err := getRollout(ctx, namespace, name); err == nil {
+				others = append(others, "Rollout")
+			} else if !apierrors.IsNotFound(err) {
+				logWarnf("Failed to check Rollout %s/%s for name collision: %v", namespace, name, err)
+			}
+		}
+	}
+	return others
 }
 
 // Deletes orphaned PodDisruptionBudgets that no longer have an associated Deployment,
@@ -1633,9 +1689,19 @@ func garbageCollectOrphanedPDBs(ctx context.Context, clientset kubernetes.Interf
 
 		var rollout *rolloutWorkload
 		var errRollout error
-		if _, rolloutsOn := getRolloutSupport(); rolloutsOn {
+		switch getRolloutSupportMode() {
+		case rolloutModeOn:
 			rollout, errRollout = getRollout(ctx, pdb.Namespace, workloadName)
-		} else {
+		case rolloutModeSuspended:
+			// Cannot confirm Rollout absence. If Deploy/STS are also missing, skip
+			// orphan deletion rather than deleting PDBs that may still back Rollouts.
+			if apierrors.IsNotFound(errDep) && apierrors.IsNotFound(errSts) {
+				logDebugf("Skipping GC for PDB %s/%s: Rollout support is suspended; cannot confirm Rollout %q absence",
+					pdb.Namespace, pdb.Name, workloadName)
+				continue
+			}
+			errRollout = apierrors.NewNotFound(getRolloutGVR().GroupResource(), workloadName)
+		default:
 			errRollout = apierrors.NewNotFound(getRolloutGVR().GroupResource(), workloadName)
 		}
 
@@ -1731,11 +1797,12 @@ func pickGCWorkloadReplicas(pdb policyv1.PodDisruptionBudget, workloadName strin
 		return candidates[0].replicas
 	}
 
-	matched := make([]gcWorkloadCandidate, 0, len(candidates))
+	exact := make([]gcWorkloadCandidate, 0, len(candidates))
+	covered := make([]gcWorkloadCandidate, 0, len(candidates))
 	for _, c := range candidates {
 		if pdb.Spec.Selector != nil && c.selector != nil &&
 			apiequality.Semantic.DeepEqual(pdb.Spec.Selector, c.selector) {
-			matched = append(matched, c)
+			exact = append(exact, c)
 			continue
 		}
 		covers, err := pdbCoversPodTemplate(&pdb, c.podTemplateLabels)
@@ -1745,29 +1812,53 @@ func pickGCWorkloadReplicas(pdb policyv1.PodDisruptionBudget, workloadName strin
 			continue
 		}
 		if covers {
-			matched = append(matched, c)
+			covered = append(covered, c)
 		}
-	}
-	if len(matched) == 1 {
-		return matched[0].replicas
-	}
-	if len(matched) > 1 {
-		kinds := make([]string, 0, len(matched))
-		for _, c := range matched {
-			kinds = append(kinds, c.kind)
-		}
-		logWarnf("PDB %s/%s matches multiple workloads named %q (%v); using %s replicas for under-replication GC",
-			pdb.Namespace, pdb.Name, workloadName, kinds, matched[0].kind)
-		return matched[0].replicas
 	}
 
-	kinds := make([]string, 0, len(candidates))
-	for _, c := range candidates {
+	// Prefer exact selector matches; among ties (or coverage-only matches), use the
+	// highest replica count so under-replication GC does not delete a PDB that any
+	// matching multi-replica owner still needs.
+	if len(exact) > 0 {
+		if len(exact) > 1 {
+			logWarnf("PDB %s/%s exactly matches multiple workloads named %q (%v); using highest replica count",
+				pdb.Namespace, pdb.Name, workloadName, gcCandidateKinds(exact))
+		}
+		return maxReplicasAmong(exact)
+	}
+	if len(covered) > 0 {
+		if len(covered) > 1 {
+			logWarnf("PDB %s/%s covers multiple workloads named %q (%v); using highest replica count",
+				pdb.Namespace, pdb.Name, workloadName, gcCandidateKinds(covered))
+		}
+		return maxReplicasAmong(covered)
+	}
+
+	logWarnf("PDB %s/%s: multiple workloads named %q exist (%v) without a clear selector match; using highest replica count",
+		pdb.Namespace, pdb.Name, workloadName, gcCandidateKinds(candidates))
+	return maxReplicasAmong(candidates)
+}
+
+func gcCandidateKinds(cands []gcWorkloadCandidate) []string {
+	kinds := make([]string, 0, len(cands))
+	for _, c := range cands {
 		kinds = append(kinds, c.kind)
 	}
-	logWarnf("PDB %s/%s: multiple workloads named %q exist (%v) without a clear selector match; using %s replicas",
-		pdb.Namespace, pdb.Name, workloadName, kinds, candidates[0].kind)
-	return candidates[0].replicas
+	return kinds
+}
+
+func maxReplicasAmong(cands []gcWorkloadCandidate) *int32 {
+	var best *int32
+	for i := range cands {
+		r := cands[i].replicas
+		if r == nil {
+			continue
+		}
+		if best == nil || *r > *best {
+			best = r
+		}
+	}
+	return best
 }
 
 // Reconcile all workloads that use default PDB config

@@ -40,28 +40,70 @@ type rolloutWorkload struct {
 	AvailableReplicas int32
 }
 
+type rolloutMode int
+
+const (
+	// rolloutModeOff: CRD absent / never enabled / explicitly disabled.
+	rolloutModeOff rolloutMode = iota
+	// rolloutModeOn: informer active; GC may treat missing Rollouts as NotFound.
+	rolloutModeOn
+	// rolloutModeSuspended: was enabled but sync failed; GC must not orphan PDBs
+	// as if Rollouts are absent while the CRD may still be installed.
+	rolloutModeSuspended
+)
+
 var (
-	rolloutSupportMu        sync.RWMutex
-	rolloutSupportAvailable bool
-	rolloutDynamicClient    dynamic.Interface
-	activeRolloutGVR        = schema.GroupVersionResource{
+	rolloutSupportMu     sync.RWMutex
+	rolloutSupportMode   = rolloutModeOff
+	rolloutDynamicClient dynamic.Interface
+	activeRolloutGVR     = schema.GroupVersionResource{
 		Group:    rolloutGroup,
 		Version:  rolloutVersionPreferred,
 		Resource: rolloutResource,
 	}
 )
 
-func setRolloutSupport(client dynamic.Interface, available bool) {
+func setRolloutSupportOff() {
+	rolloutSupportMu.Lock()
+	defer rolloutSupportMu.Unlock()
+	rolloutDynamicClient = nil
+	rolloutSupportMode = rolloutModeOff
+}
+
+func setRolloutSupportOn(client dynamic.Interface) {
 	rolloutSupportMu.Lock()
 	defer rolloutSupportMu.Unlock()
 	rolloutDynamicClient = client
-	rolloutSupportAvailable = available
+	rolloutSupportMode = rolloutModeOn
 }
 
+func suspendRolloutSupport() {
+	rolloutSupportMu.Lock()
+	defer rolloutSupportMu.Unlock()
+	rolloutDynamicClient = nil
+	rolloutSupportMode = rolloutModeSuspended
+}
+
+// getRolloutSupport returns the dynamic client when Rollout management is fully active.
 func getRolloutSupport() (dynamic.Interface, bool) {
 	rolloutSupportMu.RLock()
 	defer rolloutSupportMu.RUnlock()
-	return rolloutDynamicClient, rolloutSupportAvailable
+	return rolloutDynamicClient, rolloutSupportMode == rolloutModeOn
+}
+
+func getRolloutSupportMode() rolloutMode {
+	rolloutSupportMu.RLock()
+	defer rolloutSupportMu.RUnlock()
+	return rolloutSupportMode
+}
+
+// setRolloutSupport keeps older call sites/tests working: true enables, false disables (off).
+func setRolloutSupport(client dynamic.Interface, available bool) {
+	if available {
+		setRolloutSupportOn(client)
+		return
+	}
+	setRolloutSupportOff()
 }
 
 func getRolloutGVR() schema.GroupVersionResource {
@@ -220,13 +262,13 @@ func maybeStartRolloutInformer(ctx context.Context, clientset kubernetes.Interfa
 	if err != nil {
 		logWarnf("Failed to discover Argo Rollouts API (%s, resource=%s): %v; skipping Rollout PDB management",
 			rolloutGroup, rolloutResource, err)
-		setRolloutSupport(nil, false)
+		setRolloutSupportOff()
 		return nil, nil
 	}
 	if !available {
 		logInfof("Argo Rollouts API (%s, resource=%s) not found; skipping Rollout PDB management",
 			rolloutGroup, rolloutResource)
-		setRolloutSupport(nil, false)
+		setRolloutSupportOff()
 		return nil, nil
 	}
 	setRolloutGVR(gvr)
@@ -238,14 +280,14 @@ func maybeStartRolloutInformer(ctx context.Context, clientset kubernetes.Interfa
 	if _, err := dynClient.Resource(gvr).Namespace(metav1.NamespaceAll).List(listCtx, metav1.ListOptions{Limit: 1}); err != nil {
 		logWarnf("Argo Rollouts API %s is present but listing Rollouts failed (%v); skipping Rollout PDB management so Deployment/StatefulSet management can proceed",
 			gvr.String(), err)
-		setRolloutSupport(nil, false)
+		setRolloutSupportOff()
 		return nil, nil
 	}
 
 	// Child context so Rollout informers can be stopped independently of the main controller.
 	rolloutCtx, stopRollouts := context.WithCancel(ctx)
 
-	setRolloutSupport(dynClient, true)
+	setRolloutSupportOn(dynClient)
 	logInfof("Argo Rollouts API detected (%s); enabling Rollout PDB management", gvr.String())
 
 	factory := dynamicinformer.NewDynamicSharedInformerFactory(dynClient, 10*time.Minute)
