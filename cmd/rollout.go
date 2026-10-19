@@ -136,18 +136,25 @@ func rolloutCRDKnown() bool {
 }
 
 func getRolloutClient() (dynamic.Interface, bool) {
-	rolloutSupportMu.RLock()
-	defer rolloutSupportMu.RUnlock()
-	if rolloutClient == nil || !rolloutKnown {
-		return nil, false
-	}
-	return rolloutClient, true
+	dyn, _, ok := getRolloutClientAndGVR()
+	return dyn, ok
 }
 
 func getRolloutGVR() schema.GroupVersionResource {
+	_, gvr, _ := getRolloutClientAndGVR()
+	return gvr
+}
+
+// getRolloutClientAndGVR returns the dynamic client and GVR under one lock so
+// callers cannot observe a cleared client paired with a stale GVR (or vice versa).
+func getRolloutClientAndGVR() (dynamic.Interface, schema.GroupVersionResource, bool) {
 	rolloutSupportMu.RLock()
 	defer rolloutSupportMu.RUnlock()
-	return activeRolloutGVR
+	gvr := activeRolloutGVR
+	if rolloutClient == nil || !rolloutKnown {
+		return nil, gvr, false
+	}
+	return rolloutClient, gvr, true
 }
 
 func setRolloutGVR(gvr schema.GroupVersionResource) {
@@ -369,12 +376,51 @@ func maybeStartRolloutInformer(ctx context.Context, clientset kubernetes.Interfa
 }
 
 // retryRolloutInformerPeriodically restarts the Rollout informer when the CRD is known
-// but the informer was disabled (sync timeout / preflight failure). Stops once enabled
-// or when ctx is cancelled.
+// but the informer was disabled (sync timeout / preflight failure). Tries immediately,
+// then backs off on rolloutInformerRetryInterval until enabled or ctx is cancelled.
 func retryRolloutInformerPeriodically(ctx context.Context, clientset kubernetes.Interface, restConfig *rest.Config, setStop func(context.CancelFunc)) {
 	if restConfig == nil {
 		return
 	}
+	attempt := func() bool {
+		if rolloutInformerEnabled() || !rolloutCRDKnown() {
+			return rolloutInformerEnabled()
+		}
+		dynClient, err := dynamic.NewForConfig(restConfig)
+		if err != nil {
+			logWarnf("Rollout informer retry: dynamic client failed: %v", err)
+			return false
+		}
+		synced, stop := maybeStartRolloutInformer(ctx, clientset, dynClient)
+		if synced == nil {
+			if stop != nil {
+				stop()
+			}
+			return false
+		}
+		syncCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
+		ok := cache.WaitForCacheSync(syncCtx.Done(), synced)
+		cancel()
+		if !ok {
+			logWarnf("Rollout informer retry: sync timed out; will try again in %s", rolloutInformerRetryInterval)
+			if stop != nil {
+				stop()
+			}
+			disableRolloutInformer()
+			return false
+		}
+		if setStop != nil {
+			setStop(stop)
+		}
+		logInfof("Rollout informer recovered after retry; Rollout PDB management active")
+		return true
+	}
+
+	// Immediate first attempt so a transient startup sync failure does not wait a full interval.
+	if attempt() {
+		return
+	}
+
 	ticker := time.NewTicker(rolloutInformerRetryInterval)
 	defer ticker.Stop()
 	for {
@@ -382,46 +428,18 @@ func retryRolloutInformerPeriodically(ctx context.Context, clientset kubernetes.
 		case <-ctx.Done():
 			return
 		case <-ticker.C:
-			if rolloutInformerEnabled() || !rolloutCRDKnown() {
-				continue
+			if attempt() {
+				return
 			}
-			dynClient, err := dynamic.NewForConfig(restConfig)
-			if err != nil {
-				logWarnf("Rollout informer retry: dynamic client failed: %v", err)
-				continue
-			}
-			synced, stop := maybeStartRolloutInformer(ctx, clientset, dynClient)
-			if synced == nil {
-				if stop != nil {
-					stop()
-				}
-				continue
-			}
-			syncCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
-			ok := cache.WaitForCacheSync(syncCtx.Done(), synced)
-			cancel()
-			if !ok {
-				logWarnf("Rollout informer retry: sync timed out; will try again in %s", rolloutInformerRetryInterval)
-				if stop != nil {
-					stop()
-				}
-				disableRolloutInformer()
-				continue
-			}
-			if setStop != nil {
-				setStop(stop)
-			}
-			logInfof("Rollout informer recovered after retry; Rollout PDB management active")
 		}
 	}
 }
 
 func listRollouts(ctx context.Context, namespace string) ([]*rolloutWorkload, error) {
-	dyn, ok := getRolloutClient()
+	dyn, gvr, ok := getRolloutClientAndGVR()
 	if !ok {
 		return nil, nil
 	}
-	gvr := getRolloutGVR()
 	list, err := dyn.Resource(gvr).Namespace(namespace).List(ctx, metav1.ListOptions{})
 	if err != nil {
 		clearRolloutSupportIfAPIGone(err)
@@ -440,8 +458,7 @@ func listRollouts(ctx context.Context, namespace string) ([]*rolloutWorkload, er
 }
 
 func getRollout(ctx context.Context, namespace, name string) (*rolloutWorkload, error) {
-	dyn, ok := getRolloutClient()
-	gvr := getRolloutGVR()
+	dyn, gvr, ok := getRolloutClientAndGVR()
 	if !ok {
 		return nil, apierrors.NewNotFound(gvr.GroupResource(), name)
 	}
