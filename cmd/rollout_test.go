@@ -407,6 +407,81 @@ func TestWorkloadReplicaHealth_rollout(t *testing.T) {
 	}
 }
 
+// Regression: FixPoorPDBs must honor Rollout bypass (previously only Deploy/STS were checked).
+func TestLogAndFixPoorPDBConfig_rolloutBypassRespected(t *testing.T) {
+	rt := newControllerRuntime()
+	resetDefaultPDBConfig()
+	t.Cleanup(resetDefaultPDBConfig)
+
+	defaultPDBConfigLock.Lock()
+	defaultPDBConfig.FixPoorPDBs = true
+	defaultPDBConfigLock.Unlock()
+
+	two := int32(2)
+	pdb := &policyv1.PodDisruptionBudget{
+		ObjectMeta: metav1.ObjectMeta{Name: "castai-canary-pdb", Namespace: "default"},
+		Spec: policyv1.PodDisruptionBudgetSpec{
+			Selector:     &metav1.LabelSelector{MatchLabels: map[string]string{"app": "canary"}},
+			MinAvailable: &intstr.IntOrString{Type: intstr.Int, IntVal: 2}, // poor: equals replicas
+		},
+	}
+	clientset := fake.NewSimpleClientset(pdb)
+	rw := &rolloutWorkload{
+		Namespace: "default", Name: "canary", Replicas: &two,
+		Selector:          &metav1.LabelSelector{MatchLabels: map[string]string{"app": "canary"}},
+		PodTemplateLabels: map[string]string{"app": "canary"},
+		Annotations:       map[string]string{annotationBypass: "true"},
+		ReadyReplicas:     2, AvailableReplicas: 2,
+	}
+
+	logAndFixPoorPDBConfig(context.Background(), clientset, rt, pdb, "canary", two, "default", rw)
+
+	got, err := clientset.PolicyV1().PodDisruptionBudgets("default").Get(context.Background(), "castai-canary-pdb", metav1.GetOptions{})
+	if err != nil {
+		t.Fatalf("bypassed Rollout PDB must not be deleted by FixPoorPDBs: %v", err)
+	}
+	if got.Spec.MinAvailable == nil || got.Spec.MinAvailable.IntVal != 2 {
+		t.Fatalf("bypassed Rollout PDB must be left unchanged, got %#v", got.Spec.MinAvailable)
+	}
+}
+
+func TestLogAndFixPoorPDBConfig_rolloutWithoutBypassStillFixes(t *testing.T) {
+	rt := newControllerRuntime()
+	resetDefaultPDBConfig()
+	t.Cleanup(resetDefaultPDBConfig)
+
+	defaultPDBConfigLock.Lock()
+	defaultPDBConfig.FixPoorPDBs = true
+	defaultPDBConfig.MinAvailable = &intstr.IntOrString{Type: intstr.Int, IntVal: 1}
+	defaultPDBConfigLock.Unlock()
+
+	two := int32(2)
+	pdb := &policyv1.PodDisruptionBudget{
+		ObjectMeta: metav1.ObjectMeta{Name: "castai-canary-pdb", Namespace: "default"},
+		Spec: policyv1.PodDisruptionBudgetSpec{
+			Selector:     &metav1.LabelSelector{MatchLabels: map[string]string{"app": "canary"}},
+			MinAvailable: &intstr.IntOrString{Type: intstr.Int, IntVal: 2},
+		},
+	}
+	clientset := fake.NewSimpleClientset(pdb)
+	rw := &rolloutWorkload{
+		Namespace: "default", Name: "canary", Replicas: &two,
+		Selector:          &metav1.LabelSelector{MatchLabels: map[string]string{"app": "canary"}},
+		PodTemplateLabels: map[string]string{"app": "canary"},
+		ReadyReplicas:     2, AvailableReplicas: 2,
+	}
+
+	logAndFixPoorPDBConfig(context.Background(), clientset, rt, pdb, "canary", two, "default", rw)
+
+	got, err := clientset.PolicyV1().PodDisruptionBudgets("default").Get(context.Background(), "castai-canary-pdb", metav1.GetOptions{})
+	if err != nil {
+		t.Fatalf("expected PDB recreated with defaults: %v", err)
+	}
+	if got.Spec.MinAvailable == nil || got.Spec.MinAvailable.IntVal != 1 {
+		t.Fatalf("expected FixPoorPDBs to recreate with default minAvailable=1, got %#v", got.Spec.MinAvailable)
+	}
+}
+
 func TestSetRolloutCRDKnown_keepsKnownWithoutInformer(t *testing.T) {
 	rt := newControllerRuntime()
 	t.Cleanup(func() { rt.setRolloutSupport(nil, false) })
