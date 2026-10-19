@@ -46,6 +46,7 @@ var (
 	rolloutClient    dynamic.Interface
 	rolloutEnabled   bool // informer handlers active
 	rolloutKnown     bool // CRD discovered; GC must not treat Rollouts as absent
+	rolloutStore     cache.Store
 	activeRolloutGVR = schema.GroupVersionResource{
 		Group:    rolloutGroup,
 		Version:  rolloutVersionPreferred,
@@ -60,6 +61,7 @@ func setRolloutSupport(client dynamic.Interface, enabled bool) {
 		rolloutClient = nil
 		rolloutEnabled = false
 		rolloutKnown = false
+		rolloutStore = nil
 		return
 	}
 	rolloutClient = client
@@ -75,6 +77,7 @@ func setRolloutCRDKnown(client dynamic.Interface) {
 	rolloutClient = client
 	rolloutKnown = true
 	rolloutEnabled = false
+	rolloutStore = nil
 }
 
 // disableRolloutInformer keeps the CRD "known" for GC/collision lookups but stops
@@ -83,6 +86,29 @@ func disableRolloutInformer() {
 	rolloutSupportMu.Lock()
 	defer rolloutSupportMu.Unlock()
 	rolloutEnabled = false
+	rolloutStore = nil
+}
+
+func setRolloutStore(store cache.Store) {
+	rolloutSupportMu.Lock()
+	defer rolloutSupportMu.Unlock()
+	rolloutStore = store
+}
+
+// rolloutExistsInStore reports (exists, storeAvailable). When storeAvailable is false,
+// callers should fall back to a direct API get.
+func rolloutExistsInStore(namespace, name string) (exists bool, storeAvailable bool) {
+	rolloutSupportMu.RLock()
+	store := rolloutStore
+	rolloutSupportMu.RUnlock()
+	if store == nil {
+		return false, false
+	}
+	_, exists, err := store.GetByKey(namespace + "/" + name)
+	if err != nil {
+		return false, true
+	}
+	return exists, true
 }
 
 // clearRolloutSupportIfAPIGone disables Rollout support when the API group/version
@@ -295,6 +321,7 @@ func maybeStartRolloutInformer(ctx context.Context, clientset kubernetes.Interfa
 
 	factory := dynamicinformer.NewDynamicSharedInformerFactory(dynClient, 10*time.Minute)
 	informer := factory.ForResource(gvr).Informer()
+	setRolloutStore(informer.GetStore())
 	informer.AddEventHandler(cache.ResourceEventHandlerFuncs{
 		AddFunc: func(obj interface{}) {
 			if !rolloutInformerEnabled() {

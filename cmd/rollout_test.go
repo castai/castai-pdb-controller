@@ -17,6 +17,9 @@ import (
 	fakediscovery "k8s.io/client-go/discovery/fake"
 	dynamicfake "k8s.io/client-go/dynamic/fake"
 	"k8s.io/client-go/kubernetes/fake"
+	appsv1listers "k8s.io/client-go/listers/apps/v1"
+	clienttesting "k8s.io/client-go/testing"
+	"k8s.io/client-go/tools/cache"
 )
 
 func newUnstructuredRollout(ns, name string, replicas int64, selector, podLabels map[string]string, ready, available int64) *unstructured.Unstructured {
@@ -409,5 +412,62 @@ func TestSetRolloutCRDKnown_keepsKnownWithoutInformer(t *testing.T) {
 	}
 	if _, ok := getRolloutClient(); !ok {
 		t.Fatal("lookup client should remain available")
+	}
+}
+
+func TestSameNameConflicts_usesDeployListerNotAPIGet(t *testing.T) {
+	t.Cleanup(func() {
+		setWorkloadListers(nil, nil)
+		setRolloutSupport(nil, false)
+	})
+
+	depIndexer := cache.NewIndexer(cache.MetaNamespaceKeyFunc, cache.Indexers{
+		cache.NamespaceIndex: cache.MetaNamespaceIndexFunc,
+	})
+	stsIndexer := cache.NewIndexer(cache.MetaNamespaceKeyFunc, cache.Indexers{
+		cache.NamespaceIndex: cache.MetaNamespaceIndexFunc,
+	})
+	dep := &appsv1.Deployment{ObjectMeta: metav1.ObjectMeta{Name: "shared", Namespace: "default"}}
+	if err := depIndexer.Add(dep); err != nil {
+		t.Fatal(err)
+	}
+	setWorkloadListers(appsv1listers.NewDeploymentLister(depIndexer), appsv1listers.NewStatefulSetLister(stsIndexer))
+
+	clientset := fake.NewSimpleClientset()
+	clientset.Fake.PrependReactor("get", "deployments", func(action clienttesting.Action) (bool, runtime.Object, error) {
+		t.Fatal("sameNameConflicts must not call Deployment API Get when lister is set")
+		return true, nil, nil
+	})
+
+	others, err := sameNameConflicts(context.Background(), clientset, "default", "shared", "Rollout")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if len(others) != 1 || others[0] != "Deployment" {
+		t.Fatalf("expected [Deployment] from lister, got %v", others)
+	}
+}
+
+func TestRolloutExistsInStore(t *testing.T) {
+	t.Cleanup(func() { setRolloutSupport(nil, false) })
+
+	store := cache.NewStore(cache.MetaNamespaceKeyFunc)
+	u := newUnstructuredRollout("default", "shared", 2,
+		map[string]string{"app": "ro"},
+		map[string]string{"app": "ro"},
+		2, 2,
+	)
+	if err := store.Add(u); err != nil {
+		t.Fatal(err)
+	}
+	setRolloutStore(store)
+
+	exists, ok := rolloutExistsInStore("default", "shared")
+	if !ok || !exists {
+		t.Fatalf("expected store hit, ok=%v exists=%v", ok, exists)
+	}
+	exists, ok = rolloutExistsInStore("default", "missing")
+	if !ok || exists {
+		t.Fatalf("expected store miss, ok=%v exists=%v", ok, exists)
 	}
 }

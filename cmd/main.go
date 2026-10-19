@@ -24,6 +24,7 @@ import (
 	"k8s.io/client-go/dynamic"
 	"k8s.io/client-go/informers"
 	"k8s.io/client-go/kubernetes"
+	appsv1listers "k8s.io/client-go/listers/apps/v1"
 	"k8s.io/client-go/rest"
 	"k8s.io/client-go/tools/cache"
 	"k8s.io/client-go/tools/clientcmd"
@@ -31,6 +32,33 @@ import (
 	"k8s.io/client-go/tools/leaderelection/resourcelock"
 	"sigs.k8s.io/yaml"
 )
+
+// Optional informer listers for cache-local same-name conflict checks.
+// Nil in unit tests → sameNameConflicts falls back to API Get.
+var (
+	workloadListerMu sync.RWMutex
+	deployLister     appsv1listers.DeploymentLister
+	stsLister        appsv1listers.StatefulSetLister
+)
+
+func setWorkloadListers(deploy appsv1listers.DeploymentLister, sts appsv1listers.StatefulSetLister) {
+	workloadListerMu.Lock()
+	defer workloadListerMu.Unlock()
+	deployLister = deploy
+	stsLister = sts
+}
+
+func getDeployLister() appsv1listers.DeploymentLister {
+	workloadListerMu.RLock()
+	defer workloadListerMu.RUnlock()
+	return deployLister
+}
+
+func getSTSLister() appsv1listers.StatefulSetLister {
+	workloadListerMu.RLock()
+	defer workloadListerMu.RUnlock()
+	return stsLister
+}
 
 const (
 	configMapNamespace                   = "castai-agent"
@@ -923,6 +951,8 @@ func runController(ctx context.Context, clientset *kubernetes.Clientset, restCon
 		DeleteFunc: func(obj interface{}) { deletePDBForWorkload(ctx, clientset, obj) },
 	})
 
+	setWorkloadListers(factory.Apps().V1().Deployments().Lister(), factory.Apps().V1().StatefulSets().Lister())
+
 	var rolloutSynced cache.InformerSynced
 	var stopRollouts context.CancelFunc
 	if restConfig != nil {
@@ -1680,33 +1710,95 @@ func skipSameNameConflict(ctx context.Context, clientset kubernetes.Interface, n
 }
 
 // sameNameConflicts returns other managed kinds that share namespace/name with selfKind.
+// Prefer informer listers/stores (cache-local); fall back to API Get when unavailable
+// (unit tests, or Rollout CRD known but informer disabled).
 func sameNameConflicts(ctx context.Context, clientset kubernetes.Interface, namespace, name, selfKind string) ([]string, error) {
 	others := make([]string, 0, 2)
 	if selfKind != "Deployment" {
-		_, err := clientset.AppsV1().Deployments(namespace).Get(ctx, name, metav1.GetOptions{})
-		if err == nil {
-			others = append(others, "Deployment")
-		} else if !apierrors.IsNotFound(err) {
+		exists, err := deploymentExistsForConflict(ctx, clientset, namespace, name)
+		if err != nil {
 			return nil, fmt.Errorf("Deployment %s/%s: %w", namespace, name, err)
+		}
+		if exists {
+			others = append(others, "Deployment")
 		}
 	}
 	if selfKind != "StatefulSet" {
-		_, err := clientset.AppsV1().StatefulSets(namespace).Get(ctx, name, metav1.GetOptions{})
-		if err == nil {
-			others = append(others, "StatefulSet")
-		} else if !apierrors.IsNotFound(err) {
+		exists, err := statefulSetExistsForConflict(ctx, clientset, namespace, name)
+		if err != nil {
 			return nil, fmt.Errorf("StatefulSet %s/%s: %w", namespace, name, err)
+		}
+		if exists {
+			others = append(others, "StatefulSet")
 		}
 	}
 	if selfKind != "Rollout" && rolloutCRDKnown() {
-		_, err := getRollout(ctx, namespace, name)
-		if err == nil {
-			others = append(others, "Rollout")
-		} else if !apierrors.IsNotFound(err) {
+		exists, err := rolloutExistsForConflict(ctx, namespace, name)
+		if err != nil {
 			return nil, fmt.Errorf("Rollout %s/%s: %w", namespace, name, err)
+		}
+		if exists {
+			others = append(others, "Rollout")
 		}
 	}
 	return others, nil
+}
+
+func deploymentExistsForConflict(ctx context.Context, clientset kubernetes.Interface, namespace, name string) (bool, error) {
+	if l := getDeployLister(); l != nil {
+		_, err := l.Deployments(namespace).Get(name)
+		if err == nil {
+			return true, nil
+		}
+		if apierrors.IsNotFound(err) {
+			return false, nil
+		}
+		return false, err
+	}
+	_, err := clientset.AppsV1().Deployments(namespace).Get(ctx, name, metav1.GetOptions{})
+	if err == nil {
+		return true, nil
+	}
+	if apierrors.IsNotFound(err) {
+		return false, nil
+	}
+	return false, err
+}
+
+func statefulSetExistsForConflict(ctx context.Context, clientset kubernetes.Interface, namespace, name string) (bool, error) {
+	if l := getSTSLister(); l != nil {
+		_, err := l.StatefulSets(namespace).Get(name)
+		if err == nil {
+			return true, nil
+		}
+		if apierrors.IsNotFound(err) {
+			return false, nil
+		}
+		return false, err
+	}
+	_, err := clientset.AppsV1().StatefulSets(namespace).Get(ctx, name, metav1.GetOptions{})
+	if err == nil {
+		return true, nil
+	}
+	if apierrors.IsNotFound(err) {
+		return false, nil
+	}
+	return false, err
+}
+
+func rolloutExistsForConflict(ctx context.Context, namespace, name string) (bool, error) {
+	if exists, ok := rolloutExistsInStore(namespace, name); ok {
+		return exists, nil
+	}
+	// Informer store unavailable (disabled/sync failed) — bounded API fallback.
+	_, err := getRollout(ctx, namespace, name)
+	if err == nil {
+		return true, nil
+	}
+	if apierrors.IsNotFound(err) {
+		return false, nil
+	}
+	return false, err
 }
 
 // Deletes orphaned PodDisruptionBudgets that no longer have an associated Deployment,
