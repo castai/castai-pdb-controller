@@ -1257,12 +1257,12 @@ func logAndFixPoorPDBConfig(
 			annotations = w.Annotations
 		case *appsv1.StatefulSet:
 			annotations = w.Annotations
+		case *rolloutWorkload:
+			annotations = w.Annotations
 		}
-		if annotations != nil {
-			if val, ok := annotations[annotationBypass]; ok && val == "true" {
-				// Respect bypass annotation: do not delete or recreate PDB
-				return
-			}
+		if hasBypassAnnotation(annotations) {
+			// Respect bypass annotation: do not delete or recreate PDB
+			return
 		}
 
 		key := fmt.Sprintf("%s/%s", namespace, pdb.Name)
