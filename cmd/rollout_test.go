@@ -141,7 +141,7 @@ func TestUpdateExistingPDB_rolloutUpdatesMinAvailable(t *testing.T) {
 		AvailableReplicas: 2,
 	}
 
-	updateExistingPDB(context.Background(), clientset, existing, rw.Annotations, &two, "default", "canary-api", rw)
+	updateExistingPDB(context.Background(), clientset, existing, rw)
 	got, err := clientset.PolicyV1().PodDisruptionBudgets("default").Get(context.Background(), "castai-canary-api-pdb", metav1.GetOptions{})
 	if err != nil {
 		t.Fatalf("get PDB: %v", err)
@@ -458,7 +458,7 @@ func TestUpdateExistingPDB_skipsOnNameCollision(t *testing.T) {
 		t.Fatal(err)
 	}
 	rw.Annotations = map[string]string{annotationMinAvailable: "2"}
-	updateExistingPDB(context.Background(), clientset, existing, rw.Annotations, &two, "default", "shared", rw)
+	updateExistingPDB(context.Background(), clientset, existing, rw)
 
 	got, err := clientset.PolicyV1().PodDisruptionBudgets("default").Get(context.Background(), "castai-shared-pdb", metav1.GetOptions{})
 	if err != nil {
@@ -489,7 +489,7 @@ func TestConflictingWorkloadKinds_suspendedStillDetectsRollout(t *testing.T) {
 	setRolloutSupportOn(dyn)
 	suspendRolloutSupport()
 
-	others, err := conflictingWorkloadKinds(context.Background(), clientset, "default", "shared", "Deployment")
+	others, err := conflictingWorkloadKinds(context.Background(), clientset, "default", "shared", "Deployment", false)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -517,6 +517,46 @@ func TestDeletePDBForWorkload_unwrapsTombstone(t *testing.T) {
 	deletePDBForWorkload(context.Background(), clientset, cache.DeletedFinalStateUnknown{Obj: dep})
 	if _, err := clientset.PolicyV1().PodDisruptionBudgets("default").Get(context.Background(), "castai-web-pdb", metav1.GetOptions{}); !apierrors.IsNotFound(err) {
 		t.Fatalf("expected PDB deleted via tombstone unwrap, got err=%v", err)
+	}
+}
+
+func TestDeletePDBForWorkload_deletesWhenRemainingSameNameIsBypassed(t *testing.T) {
+	resetDefaultPDBConfig()
+	t.Cleanup(resetDefaultPDBConfig)
+	t.Cleanup(func() { setRolloutSupport(nil, false) })
+
+	pdb := &policyv1.PodDisruptionBudget{
+		ObjectMeta: metav1.ObjectMeta{Name: "castai-shared-pdb", Namespace: "default"},
+		Spec:       policyv1.PodDisruptionBudgetSpec{Selector: &metav1.LabelSelector{MatchLabels: map[string]string{"app": "ro"}}},
+	}
+	// Remaining Deployment is bypassed — must not block PDB cleanup after Rollout delete.
+	dep := &appsv1.Deployment{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:        "shared",
+			Namespace:   "default",
+			Annotations: map[string]string{annotationBypass: "true"},
+		},
+	}
+	clientset := fake.NewSimpleClientset(pdb, dep)
+	u := newUnstructuredRollout("default", "shared", 2,
+		map[string]string{"app": "ro"},
+		map[string]string{"app": "ro"},
+		2, 2,
+	)
+	dyn := dynamicfake.NewSimpleDynamicClientWithCustomListKinds(
+		runtime.NewScheme(),
+		map[schema.GroupVersionResource]string{getRolloutGVR(): "RolloutList"},
+		u,
+	)
+	setRolloutSupport(dyn, true)
+
+	rw, err := parseRolloutWorkload(u)
+	if err != nil {
+		t.Fatal(err)
+	}
+	deletePDBForWorkload(context.Background(), clientset, rw)
+	if _, err := clientset.PolicyV1().PodDisruptionBudgets("default").Get(context.Background(), "castai-shared-pdb", metav1.GetOptions{}); !apierrors.IsNotFound(err) {
+		t.Fatalf("expected PDB deleted when remaining same-named Deploy is bypassed, got err=%v", err)
 	}
 }
 

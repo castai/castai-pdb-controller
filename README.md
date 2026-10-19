@@ -10,7 +10,7 @@ This controller enables safe, automated disruption management with per-workload 
 - **Automatic PDB Creation/Update:**  
   Ensures every eligible Deployment/StatefulSet/Rollout has a PDB, using defaults or per-workload overrides.
 
-  **Rollout notes:** Only Rollouts with an inline `spec.selector` are supported (`workloadRef`-based Rollouts are skipped with a warning). PDB names remain `castai-<name>-pdb`; if a Deployment, StatefulSet, and/or Rollout share the same name in a namespace, the controller skips PDB management for those workloads to avoid ownership conflicts.
+  **Rollout notes:** Only Rollouts with an inline `spec.selector` are supported (`workloadRef`-based Rollouts are skipped with a warning). PDB names remain `castai-<name>-pdb`; if a Deployment, StatefulSet, and/or Rollout share the same name in a namespace, the controller skips PDB management for those workloads to avoid ownership conflicts. On delete, if every remaining same-named workload has the bypass annotation, the PDB is removed so it is not left orphaned.
 
 - **Annotation-Based Customization:**  
   Users can set `minAvailable`, `maxUnavailable`, or opt out of PDB management with annotations.

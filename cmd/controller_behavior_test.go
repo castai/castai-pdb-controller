@@ -488,7 +488,7 @@ func TestUpdateExistingPDB_deletesWhenScaledBelowTwoReplicas(t *testing.T) {
 		},
 	}
 
-	updateExistingPDB(context.Background(), clientset, existingPDB, nil, &one, "default", "myapp", dep)
+	updateExistingPDB(context.Background(), clientset, existingPDB, dep)
 	if _, err := clientset.PolicyV1().PodDisruptionBudgets("default").Get(context.Background(), "castai-myapp-pdb", metav1.GetOptions{}); !apierrors.IsNotFound(err) {
 		t.Fatalf("expected PDB to be deleted on scale-down, got err=%v", err)
 	}
@@ -523,7 +523,7 @@ func TestUpdateExistingPDB_recreatesWhenSelectorChanges(t *testing.T) {
 		Status: appsv1.DeploymentStatus{ReadyReplicas: 2, AvailableReplicas: 2},
 	}
 
-	updateExistingPDB(context.Background(), clientset, existingPDB, nil, &two, "default", "myapp", dep)
+	updateExistingPDB(context.Background(), clientset, existingPDB, dep)
 
 	got, err := clientset.PolicyV1().PodDisruptionBudgets("default").Get(context.Background(), "castai-myapp-pdb", metav1.GetOptions{})
 	if err != nil {
