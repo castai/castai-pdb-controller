@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"math"
 	"testing"
 
 	appsv1 "k8s.io/api/apps/v1"
@@ -280,10 +281,12 @@ func TestPickGCWorkloadReplicas_prefersSelectorMatch(t *testing.T) {
 	t.Parallel()
 	one := int32(1)
 	three := int32(3)
-	pdb := &policyv1.PodDisruptionBudget{
+	pdb := policyv1.PodDisruptionBudget{
 		ObjectMeta: metav1.ObjectMeta{Name: "castai-shared-pdb", Namespace: "default"},
 		Spec: policyv1.PodDisruptionBudgetSpec{
-			Selector: &metav1.LabelSelector{MatchLabels: map[string]string{"app": "rollout-app"}},
+			// Insert keys in a different order than the Rollout selector map literal below;
+			// Semantic.DeepEqual must still treat them as equal.
+			Selector: &metav1.LabelSelector{MatchLabels: map[string]string{"tier": "api", "app": "rollout-app"}},
 		},
 	}
 	got := pickGCWorkloadReplicas(pdb, "shared", []gcWorkloadCandidate{
@@ -294,14 +297,28 @@ func TestPickGCWorkloadReplicas_prefersSelectorMatch(t *testing.T) {
 			podTemplateLabels: map[string]string{"app": "deploy-app"},
 		},
 		{
-			kind:              "Rollout",
-			replicas:          &three,
-			selector:          &metav1.LabelSelector{MatchLabels: map[string]string{"app": "rollout-app"}},
-			podTemplateLabels: map[string]string{"app": "rollout-app"},
+			kind:     "Rollout",
+			replicas: &three,
+			selector: &metav1.LabelSelector{MatchLabels: map[string]string{
+				"app":  "rollout-app",
+				"tier": "api",
+			}},
+			podTemplateLabels: map[string]string{"app": "rollout-app", "tier": "api"},
 		},
 	})
 	if got == nil || *got != 3 {
 		t.Fatalf("expected Rollout replicas=3, got %v", got)
+	}
+}
+
+func TestInt64ToInt32_overflow(t *testing.T) {
+	t.Parallel()
+	if _, err := int64ToInt32(math.MaxInt32+1, "spec.replicas"); err == nil {
+		t.Fatal("expected overflow error")
+	}
+	got, err := int64ToInt32(3, "spec.replicas")
+	if err != nil || got != 3 {
+		t.Fatalf("got %d err=%v", got, err)
 	}
 }
 

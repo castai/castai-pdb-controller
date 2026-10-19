@@ -17,6 +17,7 @@ import (
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
 	policyv1 "k8s.io/api/policy/v1"
+	apiequality "k8s.io/apimachinery/pkg/api/equality"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/labels"
@@ -1619,7 +1620,8 @@ func garbageCollectOrphanedPDBs(ctx context.Context, clientset kubernetes.Interf
 		return
 	}
 
-	for _, pdb := range pdbs.Items {
+	for i := range pdbs.Items {
+		pdb := pdbs.Items[i]
 		if !strings.HasPrefix(pdb.Name, "castai-") || !strings.HasSuffix(pdb.Name, "-pdb") {
 			continue
 		}
@@ -1694,7 +1696,7 @@ func garbageCollectOrphanedPDBs(ctx context.Context, clientset kubernetes.Interf
 				podTemplateLabels: rollout.PodTemplateLabels,
 			})
 		}
-		replicas := pickGCWorkloadReplicas(&pdb, workloadName, candidates)
+		replicas := pickGCWorkloadReplicas(pdb, workloadName, candidates)
 		if replicas == nil || *replicas < 2 {
 			err := clientset.PolicyV1().PodDisruptionBudgets(pdb.Namespace).Delete(ctx, pdb.Name, metav1.DeleteOptions{})
 			if err != nil {
@@ -1720,7 +1722,8 @@ type gcWorkloadCandidate struct {
 
 // pickGCWorkloadReplicas chooses which same-named workload's replica count to use for
 // under-replication GC. Prefer an exact selector match or PDB coverage of pod template labels.
-func pickGCWorkloadReplicas(pdb *policyv1.PodDisruptionBudget, workloadName string, candidates []gcWorkloadCandidate) *int32 {
+// PDB is passed by value to avoid depending on range-loop variable lifetime.
+func pickGCWorkloadReplicas(pdb policyv1.PodDisruptionBudget, workloadName string, candidates []gcWorkloadCandidate) *int32 {
 	if len(candidates) == 0 {
 		return nil
 	}
@@ -1730,15 +1733,18 @@ func pickGCWorkloadReplicas(pdb *policyv1.PodDisruptionBudget, workloadName stri
 
 	matched := make([]gcWorkloadCandidate, 0, len(candidates))
 	for _, c := range candidates {
-		if pdb.Spec.Selector != nil && c.selector != nil {
-			pdbSel, err1 := metav1.LabelSelectorAsSelector(pdb.Spec.Selector)
-			wSel, err2 := metav1.LabelSelectorAsSelector(c.selector)
-			if err1 == nil && err2 == nil && pdbSel.String() == wSel.String() {
-				matched = append(matched, c)
-				continue
-			}
+		if pdb.Spec.Selector != nil && c.selector != nil &&
+			apiequality.Semantic.DeepEqual(pdb.Spec.Selector, c.selector) {
+			matched = append(matched, c)
+			continue
 		}
-		if covers, _ := pdbCoversPodTemplate(pdb, c.podTemplateLabels); covers {
+		covers, err := pdbCoversPodTemplate(&pdb, c.podTemplateLabels)
+		if err != nil {
+			logWarnf("PDB %s/%s: failed to evaluate coverage for %s %q during GC: %v",
+				pdb.Namespace, pdb.Name, c.kind, workloadName, err)
+			continue
+		}
+		if covers {
 			matched = append(matched, c)
 		}
 	}

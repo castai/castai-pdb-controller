@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"fmt"
+	"math"
 	"sync"
 	"time"
 
@@ -141,7 +142,10 @@ func parseRolloutWorkload(u *unstructured.Unstructured) (*rolloutWorkload, error
 	if replicas, found, err := unstructured.NestedInt64(u.Object, "spec", "replicas"); err != nil {
 		return nil, fmt.Errorf("spec.replicas: %w", err)
 	} else if found {
-		r := int32(replicas)
+		r, err := int64ToInt32(replicas, "spec.replicas")
+		if err != nil {
+			return nil, err
+		}
 		rw.Replicas = &r
 	}
 
@@ -164,19 +168,34 @@ func parseRolloutWorkload(u *unstructured.Unstructured) (*rolloutWorkload, error
 	if ready, found, err := unstructured.NestedInt64(u.Object, "status", "readyReplicas"); err != nil {
 		return nil, fmt.Errorf("status.readyReplicas: %w", err)
 	} else if found {
-		rw.ReadyReplicas = int32(ready)
+		r, err := int64ToInt32(ready, "status.readyReplicas")
+		if err != nil {
+			return nil, err
+		}
+		rw.ReadyReplicas = r
 	}
 
 	if available, found, err := unstructured.NestedInt64(u.Object, "status", "availableReplicas"); err != nil {
 		return nil, fmt.Errorf("status.availableReplicas: %w", err)
 	} else if found {
-		rw.AvailableReplicas = int32(available)
+		a, err := int64ToInt32(available, "status.availableReplicas")
+		if err != nil {
+			return nil, err
+		}
+		rw.AvailableReplicas = a
 	} else {
 		// When available is unset, treat ready as available (same idea as StatefulSets).
 		rw.AvailableReplicas = rw.ReadyReplicas
 	}
 
 	return rw, nil
+}
+
+func int64ToInt32(v int64, field string) (int32, error) {
+	if v < math.MinInt32 || v > math.MaxInt32 {
+		return 0, fmt.Errorf("%s value %d overflows int32", field, v)
+	}
+	return int32(v), nil
 }
 
 func rolloutFromInformerObj(obj interface{}) (*rolloutWorkload, error) {
