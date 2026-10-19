@@ -77,9 +77,10 @@ func TestInt64ToInt32_overflow(t *testing.T) {
 }
 
 func TestCreatePDBForWorkload_rolloutHappyPath(t *testing.T) {
+	rt := newControllerRuntime()
 	resetDefaultPDBConfig()
 	t.Cleanup(resetDefaultPDBConfig)
-	t.Cleanup(func() { setRolloutSupport(nil, false) })
+	t.Cleanup(func() { rt.setRolloutSupport(nil, false) })
 
 	two := int32(2)
 	rw := &rolloutWorkload{
@@ -89,7 +90,7 @@ func TestCreatePDBForWorkload_rolloutHappyPath(t *testing.T) {
 		ReadyReplicas:     2, AvailableReplicas: 2,
 	}
 	clientset := fake.NewSimpleClientset()
-	createPDBForWorkload(context.Background(), clientset, rw)
+	createPDBForWorkload(context.Background(), clientset, rt, rw)
 
 	got, err := clientset.PolicyV1().PodDisruptionBudgets("default").Get(context.Background(), "castai-canary-api-pdb", metav1.GetOptions{})
 	if err != nil {
@@ -101,6 +102,7 @@ func TestCreatePDBForWorkload_rolloutHappyPath(t *testing.T) {
 }
 
 func TestCreatePDBForWorkload_rolloutSkipsNilSelector(t *testing.T) {
+	rt := newControllerRuntime()
 	resetDefaultPDBConfig()
 	t.Cleanup(resetDefaultPDBConfig)
 
@@ -110,16 +112,17 @@ func TestCreatePDBForWorkload_rolloutSkipsNilSelector(t *testing.T) {
 		Selector: nil, ReadyReplicas: 2, AvailableReplicas: 2,
 	}
 	clientset := fake.NewSimpleClientset()
-	createPDBForWorkload(context.Background(), clientset, rw)
+	createPDBForWorkload(context.Background(), clientset, rt, rw)
 	if _, err := clientset.PolicyV1().PodDisruptionBudgets("default").Get(context.Background(), "castai-ref-ro-pdb", metav1.GetOptions{}); !apierrors.IsNotFound(err) {
 		t.Fatalf("expected no PDB for nil-selector Rollout, got err=%v", err)
 	}
 }
 
 func TestCreatePDBForWorkload_skipsOnSameNameConflict(t *testing.T) {
+	rt := newControllerRuntime()
 	resetDefaultPDBConfig()
 	t.Cleanup(resetDefaultPDBConfig)
-	t.Cleanup(func() { setRolloutSupport(nil, false) })
+	t.Cleanup(func() { rt.setRolloutSupport(nil, false) })
 
 	two := int32(2)
 	dep := &appsv1.Deployment{
@@ -139,16 +142,16 @@ func TestCreatePDBForWorkload_skipsOnSameNameConflict(t *testing.T) {
 	)
 	dyn := dynamicfake.NewSimpleDynamicClientWithCustomListKinds(
 		runtime.NewScheme(),
-		map[schema.GroupVersionResource]string{getRolloutGVR(): "RolloutList"},
+		map[schema.GroupVersionResource]string{rt.getRolloutGVR(): "RolloutList"},
 		u,
 	)
-	setRolloutSupport(dyn, true)
+	rt.setRolloutSupport(dyn, true)
 
 	rw, err := parseRolloutWorkload(u)
 	if err != nil {
 		t.Fatal(err)
 	}
-	createPDBForWorkload(context.Background(), clientset, rw)
+	createPDBForWorkload(context.Background(), clientset, rt, rw)
 	if _, err := clientset.PolicyV1().PodDisruptionBudgets("default").Get(context.Background(), "castai-shared-pdb", metav1.GetOptions{}); !apierrors.IsNotFound(err) {
 		t.Fatalf("expected skip on Deploy+Rollout same name, got err=%v", err)
 	}
@@ -164,16 +167,17 @@ func TestCreatePDBForWorkload_skipsOnSameNameConflict(t *testing.T) {
 		},
 	}
 	clientset2 := fake.NewSimpleClientset(dep, pdb)
-	createPDBForWorkload(context.Background(), clientset2, dep)
+	createPDBForWorkload(context.Background(), clientset2, rt, dep)
 	if _, err := clientset2.PolicyV1().PodDisruptionBudgets("default").Get(context.Background(), "castai-shared-pdb", metav1.GetOptions{}); err != nil {
 		t.Fatalf("same-name guard must run before under-replicated delete: %v", err)
 	}
 }
 
 func TestGarbageCollectOrphanedPDBs_keepsWhenRolloutExists(t *testing.T) {
+	rt := newControllerRuntime()
 	resetDefaultPDBConfig()
 	t.Cleanup(resetDefaultPDBConfig)
-	t.Cleanup(func() { setRolloutSupport(nil, false) })
+	t.Cleanup(func() { rt.setRolloutSupport(nil, false) })
 
 	pdb := &policyv1.PodDisruptionBudget{
 		ObjectMeta: metav1.ObjectMeta{Name: "castai-canary-api-pdb", Namespace: "default"},
@@ -190,21 +194,22 @@ func TestGarbageCollectOrphanedPDBs_keepsWhenRolloutExists(t *testing.T) {
 	)
 	dyn := dynamicfake.NewSimpleDynamicClientWithCustomListKinds(
 		runtime.NewScheme(),
-		map[schema.GroupVersionResource]string{getRolloutGVR(): "RolloutList"},
+		map[schema.GroupVersionResource]string{rt.getRolloutGVR(): "RolloutList"},
 		u,
 	)
-	setRolloutSupport(dyn, true)
+	rt.setRolloutSupport(dyn, true)
 
-	garbageCollectOrphanedPDBs(context.Background(), clientset)
+	garbageCollectOrphanedPDBs(context.Background(), clientset, rt)
 	if _, err := clientset.PolicyV1().PodDisruptionBudgets("default").Get(context.Background(), "castai-canary-api-pdb", metav1.GetOptions{}); err != nil {
 		t.Fatalf("PDB should be kept while Rollout exists: %v", err)
 	}
 }
 
 func TestGarbageCollectOrphanedPDBs_skipsOrphanDeleteWhenInformerDisabledButCRDKnown(t *testing.T) {
+	rt := newControllerRuntime()
 	resetDefaultPDBConfig()
 	t.Cleanup(resetDefaultPDBConfig)
-	t.Cleanup(func() { setRolloutSupport(nil, false) })
+	t.Cleanup(func() { rt.setRolloutSupport(nil, false) })
 
 	pdb := &policyv1.PodDisruptionBudget{
 		ObjectMeta: metav1.ObjectMeta{Name: "castai-only-ro-pdb", Namespace: "default"},
@@ -221,20 +226,20 @@ func TestGarbageCollectOrphanedPDBs_skipsOrphanDeleteWhenInformerDisabledButCRDK
 	)
 	dyn := dynamicfake.NewSimpleDynamicClientWithCustomListKinds(
 		runtime.NewScheme(),
-		map[schema.GroupVersionResource]string{getRolloutGVR(): "RolloutList"},
+		map[schema.GroupVersionResource]string{rt.getRolloutGVR(): "RolloutList"},
 		u,
 	)
-	setRolloutSupport(dyn, true)
-	disableRolloutInformer()
+	rt.setRolloutSupport(dyn, true)
+	rt.disableRolloutInformer()
 
-	garbageCollectOrphanedPDBs(context.Background(), clientset)
+	garbageCollectOrphanedPDBs(context.Background(), clientset, rt)
 	if _, err := clientset.PolicyV1().PodDisruptionBudgets("default").Get(context.Background(), "castai-only-ro-pdb", metav1.GetOptions{}); err != nil {
 		t.Fatalf("PDB must be kept when CRD known and Rollout still exists: %v", err)
 	}
-	if rolloutInformerEnabled() {
+	if rt.rolloutInformerEnabled() {
 		t.Fatal("expected informer disabled")
 	}
-	if !rolloutCRDKnown() {
+	if !rt.rolloutCRDKnown() {
 		t.Fatal("expected CRD still known")
 	}
 }
@@ -301,6 +306,7 @@ func TestDiscoverRolloutGVR_fallbackVersion(t *testing.T) {
 }
 
 func TestCreatePDBForWorkload_rolloutHonorsMinAvailableAnnotation(t *testing.T) {
+	rt := newControllerRuntime()
 	resetDefaultPDBConfig()
 	t.Cleanup(resetDefaultPDBConfig)
 
@@ -313,7 +319,7 @@ func TestCreatePDBForWorkload_rolloutHonorsMinAvailableAnnotation(t *testing.T) 
 		ReadyReplicas:     2, AvailableReplicas: 2,
 	}
 	clientset := fake.NewSimpleClientset()
-	createPDBForWorkload(context.Background(), clientset, rw)
+	createPDBForWorkload(context.Background(), clientset, rt, rw)
 	got, err := clientset.PolicyV1().PodDisruptionBudgets("default").Get(context.Background(), "castai-anno-ro-pdb", metav1.GetOptions{})
 	if err != nil {
 		t.Fatalf("expected PDB: %v", err)
@@ -324,9 +330,10 @@ func TestCreatePDBForWorkload_rolloutHonorsMinAvailableAnnotation(t *testing.T) 
 }
 
 func TestDeletePDBForWorkload_keepsPDBWhenSameNamedRolloutExists(t *testing.T) {
+	rt := newControllerRuntime()
 	resetDefaultPDBConfig()
 	t.Cleanup(resetDefaultPDBConfig)
-	t.Cleanup(func() { setRolloutSupport(nil, false) })
+	t.Cleanup(func() { rt.setRolloutSupport(nil, false) })
 
 	pdb := &policyv1.PodDisruptionBudget{
 		ObjectMeta: metav1.ObjectMeta{Name: "castai-shared-pdb", Namespace: "default"},
@@ -341,18 +348,19 @@ func TestDeletePDBForWorkload_keepsPDBWhenSameNamedRolloutExists(t *testing.T) {
 	)
 	dyn := dynamicfake.NewSimpleDynamicClientWithCustomListKinds(
 		runtime.NewScheme(),
-		map[schema.GroupVersionResource]string{getRolloutGVR(): "RolloutList"},
+		map[schema.GroupVersionResource]string{rt.getRolloutGVR(): "RolloutList"},
 		u,
 	)
-	setRolloutSupport(dyn, true)
+	rt.setRolloutSupport(dyn, true)
 
-	deletePDBForWorkload(context.Background(), clientset, dep)
+	deletePDBForWorkload(context.Background(), clientset, rt, dep)
 	if _, err := clientset.PolicyV1().PodDisruptionBudgets("default").Get(context.Background(), "castai-shared-pdb", metav1.GetOptions{}); err != nil {
 		t.Fatalf("PDB must remain when same-named Rollout still exists: %v", err)
 	}
 }
 
 func TestHandleWorkloadUpdate_rolloutAnnotationUpdatesPDB(t *testing.T) {
+	rt := newControllerRuntime()
 	resetDefaultPDBConfig()
 	t.Cleanup(resetDefaultPDBConfig)
 
@@ -378,7 +386,7 @@ func TestHandleWorkloadUpdate_rolloutAnnotationUpdatesPDB(t *testing.T) {
 		Annotations:       map[string]string{annotationMinAvailable: "2"},
 		ReadyReplicas:     2, AvailableReplicas: 2,
 	}
-	handleWorkloadUpdate(context.Background(), clientset, oldRW, newRW)
+	handleWorkloadUpdate(context.Background(), clientset, rt, oldRW, newRW)
 	got, err := clientset.PolicyV1().PodDisruptionBudgets("default").Get(context.Background(), "castai-canary-api-pdb", metav1.GetOptions{})
 	if err != nil {
 		t.Fatalf("get PDB: %v", err)
@@ -399,27 +407,29 @@ func TestWorkloadReplicaHealth_rollout(t *testing.T) {
 }
 
 func TestSetRolloutCRDKnown_keepsKnownWithoutInformer(t *testing.T) {
-	t.Cleanup(func() { setRolloutSupport(nil, false) })
+	rt := newControllerRuntime()
+	t.Cleanup(func() { rt.setRolloutSupport(nil, false) })
 	dyn := dynamicfake.NewSimpleDynamicClientWithCustomListKinds(
 		runtime.NewScheme(),
-		map[schema.GroupVersionResource]string{getRolloutGVR(): "RolloutList"},
+		map[schema.GroupVersionResource]string{rt.getRolloutGVR(): "RolloutList"},
 	)
-	setRolloutCRDKnown(dyn)
-	if !rolloutCRDKnown() {
+	rt.setRolloutCRDKnown(dyn)
+	if !rt.rolloutCRDKnown() {
 		t.Fatal("expected CRD known")
 	}
-	if rolloutInformerEnabled() {
+	if rt.rolloutInformerEnabled() {
 		t.Fatal("informer must stay disabled")
 	}
-	if _, ok := getRolloutClient(); !ok {
+	if _, ok := rt.getRolloutClient(); !ok {
 		t.Fatal("lookup client should remain available")
 	}
 }
 
 func TestSameNameConflicts_usesDeployListerNotAPIGet(t *testing.T) {
+	rt := newControllerRuntime()
 	t.Cleanup(func() {
-		setWorkloadListers(nil, nil)
-		setRolloutSupport(nil, false)
+		rt.setWorkloadListers(nil, nil)
+		rt.setRolloutSupport(nil, false)
 	})
 
 	depIndexer := cache.NewIndexer(cache.MetaNamespaceKeyFunc, cache.Indexers{
@@ -432,7 +442,7 @@ func TestSameNameConflicts_usesDeployListerNotAPIGet(t *testing.T) {
 	if err := depIndexer.Add(dep); err != nil {
 		t.Fatal(err)
 	}
-	setWorkloadListers(appsv1listers.NewDeploymentLister(depIndexer), appsv1listers.NewStatefulSetLister(stsIndexer))
+	rt.setWorkloadListers(appsv1listers.NewDeploymentLister(depIndexer), appsv1listers.NewStatefulSetLister(stsIndexer))
 
 	clientset := fake.NewSimpleClientset()
 	clientset.Fake.PrependReactor("get", "deployments", func(action clienttesting.Action) (bool, runtime.Object, error) {
@@ -440,7 +450,7 @@ func TestSameNameConflicts_usesDeployListerNotAPIGet(t *testing.T) {
 		return true, nil, nil
 	})
 
-	others, err := sameNameConflicts(context.Background(), clientset, "default", "shared", "Rollout")
+	others, err := sameNameConflicts(context.Background(), clientset, rt, "default", "shared", "Rollout")
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -450,7 +460,8 @@ func TestSameNameConflicts_usesDeployListerNotAPIGet(t *testing.T) {
 }
 
 func TestRolloutExistsInStore(t *testing.T) {
-	t.Cleanup(func() { setRolloutSupport(nil, false) })
+	rt := newControllerRuntime()
+	t.Cleanup(func() { rt.setRolloutSupport(nil, false) })
 
 	store := cache.NewStore(cache.MetaNamespaceKeyFunc)
 	u := newUnstructuredRollout("default", "shared", 2,
@@ -461,13 +472,13 @@ func TestRolloutExistsInStore(t *testing.T) {
 	if err := store.Add(u); err != nil {
 		t.Fatal(err)
 	}
-	setRolloutStore(store)
+	rt.setRolloutStore(store)
 
-	exists, ok := rolloutExistsInStore("default", "shared")
+	exists, ok := rt.rolloutExistsInStore("default", "shared")
 	if !ok || !exists {
 		t.Fatalf("expected store hit, ok=%v exists=%v", ok, exists)
 	}
-	exists, ok = rolloutExistsInStore("default", "missing")
+	exists, ok = rt.rolloutExistsInStore("default", "missing")
 	if !ok || exists {
 		t.Fatalf("expected store miss, ok=%v exists=%v", ok, exists)
 	}
@@ -480,9 +491,10 @@ func (errStore) GetByKey(string) (interface{}, bool, error) {
 }
 
 func TestRolloutExistsInStore_errorFallsBack(t *testing.T) {
-	t.Cleanup(func() { setRolloutSupport(nil, false) })
-	setRolloutStore(errStore{Store: cache.NewStore(cache.MetaNamespaceKeyFunc)})
-	exists, ok := rolloutExistsInStore("default", "shared")
+	rt := newControllerRuntime()
+	t.Cleanup(func() { rt.setRolloutSupport(nil, false) })
+	rt.setRolloutStore(errStore{Store: cache.NewStore(cache.MetaNamespaceKeyFunc)})
+	exists, ok := rt.rolloutExistsInStore("default", "shared")
 	if ok || exists {
 		t.Fatalf("GetByKey error must force API fallback (ok=false), got ok=%v exists=%v", ok, exists)
 	}

@@ -465,6 +465,7 @@ func TestWaitForPDBDeletion_returnsWhenPDBIsGone(t *testing.T) {
 }
 
 func TestUpdateExistingPDB_deletesWhenScaledBelowTwoReplicas(t *testing.T) {
+	rt := newControllerRuntime()
 	resetDefaultPDBConfig()
 	t.Cleanup(resetDefaultPDBConfig)
 
@@ -488,13 +489,14 @@ func TestUpdateExistingPDB_deletesWhenScaledBelowTwoReplicas(t *testing.T) {
 		},
 	}
 
-	updateExistingPDB(context.Background(), clientset, existingPDB, nil, &one, "default", "myapp", dep)
+	updateExistingPDB(context.Background(), clientset, rt, existingPDB, nil, &one, "default", "myapp", dep)
 	if _, err := clientset.PolicyV1().PodDisruptionBudgets("default").Get(context.Background(), "castai-myapp-pdb", metav1.GetOptions{}); !apierrors.IsNotFound(err) {
 		t.Fatalf("expected PDB to be deleted on scale-down, got err=%v", err)
 	}
 }
 
 func TestUpdateExistingPDB_recreatesWhenSelectorChanges(t *testing.T) {
+	rt := newControllerRuntime()
 	resetDefaultPDBConfig()
 	t.Cleanup(resetDefaultPDBConfig)
 
@@ -523,7 +525,7 @@ func TestUpdateExistingPDB_recreatesWhenSelectorChanges(t *testing.T) {
 		Status: appsv1.DeploymentStatus{ReadyReplicas: 2, AvailableReplicas: 2},
 	}
 
-	updateExistingPDB(context.Background(), clientset, existingPDB, nil, &two, "default", "myapp", dep)
+	updateExistingPDB(context.Background(), clientset, rt, existingPDB, nil, &two, "default", "myapp", dep)
 
 	got, err := clientset.PolicyV1().PodDisruptionBudgets("default").Get(context.Background(), "castai-myapp-pdb", metav1.GetOptions{})
 	if err != nil {
@@ -535,6 +537,7 @@ func TestUpdateExistingPDB_recreatesWhenSelectorChanges(t *testing.T) {
 }
 
 func TestCreatePDBForWorkload_skipsWhenExistingPDBSelectorIsSupersetMatch(t *testing.T) {
+	rt := newControllerRuntime()
 	resetDefaultPDBConfig()
 	t.Cleanup(resetDefaultPDBConfig)
 
@@ -565,7 +568,7 @@ func TestCreatePDBForWorkload_skipsWhenExistingPDBSelectorIsSupersetMatch(t *tes
 		},
 	}
 
-	createPDBForWorkload(context.Background(), clientset, sts)
+	createPDBForWorkload(context.Background(), clientset, rt, sts)
 
 	pdbs, err := clientset.PolicyV1().PodDisruptionBudgets("default").List(context.Background(), metav1.ListOptions{})
 	if err != nil {
@@ -580,6 +583,7 @@ func TestCreatePDBForWorkload_skipsWhenExistingPDBSelectorIsSupersetMatch(t *tes
 }
 
 func TestCreatePDBForWorkload_treatsHelmPDBNamedLikeCastaiAsNonCastai(t *testing.T) {
+	rt := newControllerRuntime()
 	resetDefaultPDBConfig()
 	t.Cleanup(resetDefaultPDBConfig)
 
@@ -616,7 +620,7 @@ func TestCreatePDBForWorkload_treatsHelmPDBNamedLikeCastaiAsNonCastai(t *testing
 		},
 	}
 
-	createPDBForWorkload(context.Background(), clientset, deploy)
+	createPDBForWorkload(context.Background(), clientset, rt, deploy)
 
 	pdbs, err := clientset.PolicyV1().PodDisruptionBudgets("castai-agent").List(context.Background(), metav1.ListOptions{})
 	if err != nil {
@@ -636,6 +640,7 @@ func TestCreatePDBForWorkload_treatsHelmPDBNamedLikeCastaiAsNonCastai(t *testing
 }
 
 func TestCreatePDBForWorkload_deletesLeftoverControllerPDBWhenCastaiHelmCovers(t *testing.T) {
+	rt := newControllerRuntime()
 	resetDefaultPDBConfig()
 	t.Cleanup(resetDefaultPDBConfig)
 
@@ -669,7 +674,7 @@ func TestCreatePDBForWorkload_deletesLeftoverControllerPDBWhenCastaiHelmCovers(t
 	}
 	clientset := fake.NewSimpleClientset(helmPDB, leftover, deploy)
 
-	createPDBForWorkload(context.Background(), clientset, deploy)
+	createPDBForWorkload(context.Background(), clientset, rt, deploy)
 
 	if _, err := clientset.PolicyV1().PodDisruptionBudgets("castai-agent").Get(context.Background(), "castai-cluster-controller-pdb", metav1.GetOptions{}); !apierrors.IsNotFound(err) {
 		t.Fatalf("expected leftover controller PDB to be deleted, got err=%v", err)
@@ -684,6 +689,7 @@ func TestCreatePDBForWorkload_deletesLeftoverControllerPDBWhenCastaiHelmCovers(t
 }
 
 func TestCreatePDBForWorkload_keepsCustomerControllerPDBWhenUnrelatedHelmCovers(t *testing.T) {
+	rt := newControllerRuntime()
 	resetDefaultPDBConfig()
 	t.Cleanup(resetDefaultPDBConfig)
 
@@ -714,7 +720,7 @@ func TestCreatePDBForWorkload_keepsCustomerControllerPDBWhenUnrelatedHelmCovers(
 	}
 	clientset := fake.NewSimpleClientset(helmPDB, controllerPDB, deploy)
 
-	createPDBForWorkload(context.Background(), clientset, deploy)
+	createPDBForWorkload(context.Background(), clientset, rt, deploy)
 
 	if _, err := clientset.PolicyV1().PodDisruptionBudgets("default").Get(context.Background(), "castai-myapp-pdb", metav1.GetOptions{}); err != nil {
 		t.Fatalf("expected customer controller PDB to be preserved, got err=%v", err)
@@ -803,6 +809,7 @@ func TestScanAllPDBsForMultiplePDBs_keepsCustomerControllerPDB(t *testing.T) {
 }
 
 func TestGarbageCollectOrphanedPDBs_deletesWhenWorkloadGone(t *testing.T) {
+	rt := newControllerRuntime()
 	pdb := &policyv1.PodDisruptionBudget{
 		ObjectMeta: metav1.ObjectMeta{Name: "castai-gone-pdb", Namespace: "default"},
 		Spec: policyv1.PodDisruptionBudgetSpec{
@@ -812,7 +819,7 @@ func TestGarbageCollectOrphanedPDBs_deletesWhenWorkloadGone(t *testing.T) {
 	}
 	clientset := fake.NewSimpleClientset(pdb)
 
-	garbageCollectOrphanedPDBs(context.Background(), clientset)
+	garbageCollectOrphanedPDBs(context.Background(), clientset, rt)
 
 	if _, err := clientset.PolicyV1().PodDisruptionBudgets("default").Get(context.Background(), "castai-gone-pdb", metav1.GetOptions{}); !apierrors.IsNotFound(err) {
 		t.Fatalf("expected orphaned PDB to be deleted, got err=%v", err)
@@ -820,6 +827,7 @@ func TestGarbageCollectOrphanedPDBs_deletesWhenWorkloadGone(t *testing.T) {
 }
 
 func TestGarbageCollectOrphanedPDBs_deletesWhenWorkloadUnderReplicated(t *testing.T) {
+	rt := newControllerRuntime()
 	one := int32(1)
 	pdb := &policyv1.PodDisruptionBudget{
 		ObjectMeta: metav1.ObjectMeta{Name: "castai-myapp-pdb", Namespace: "default"},
@@ -840,7 +848,7 @@ func TestGarbageCollectOrphanedPDBs_deletesWhenWorkloadUnderReplicated(t *testin
 	}
 	clientset := fake.NewSimpleClientset(pdb, dep)
 
-	garbageCollectOrphanedPDBs(context.Background(), clientset)
+	garbageCollectOrphanedPDBs(context.Background(), clientset, rt)
 
 	if _, err := clientset.PolicyV1().PodDisruptionBudgets("default").Get(context.Background(), "castai-myapp-pdb", metav1.GetOptions{}); !apierrors.IsNotFound(err) {
 		t.Fatalf("expected under-replicated PDB to be deleted, got err=%v", err)
@@ -848,6 +856,7 @@ func TestGarbageCollectOrphanedPDBs_deletesWhenWorkloadUnderReplicated(t *testin
 }
 
 func TestGarbageCollectOrphanedPDBs_keepsPDBWhenWorkloadHasEnoughReplicas(t *testing.T) {
+	rt := newControllerRuntime()
 	two := int32(2)
 	pdb := &policyv1.PodDisruptionBudget{
 		ObjectMeta: metav1.ObjectMeta{Name: "castai-myapp-pdb", Namespace: "default"},
@@ -868,7 +877,7 @@ func TestGarbageCollectOrphanedPDBs_keepsPDBWhenWorkloadHasEnoughReplicas(t *tes
 	}
 	clientset := fake.NewSimpleClientset(pdb, dep)
 
-	garbageCollectOrphanedPDBs(context.Background(), clientset)
+	garbageCollectOrphanedPDBs(context.Background(), clientset, rt)
 
 	if _, err := clientset.PolicyV1().PodDisruptionBudgets("default").Get(context.Background(), "castai-myapp-pdb", metav1.GetOptions{}); err != nil {
 		t.Fatalf("expected PDB to be kept for workload with 2 replicas, got err=%v", err)
@@ -876,6 +885,7 @@ func TestGarbageCollectOrphanedPDBs_keepsPDBWhenWorkloadHasEnoughReplicas(t *tes
 }
 
 func TestGarbageCollectOrphanedPDBs_deletesWhenStatefulSetUnderReplicated(t *testing.T) {
+	rt := newControllerRuntime()
 	one := int32(1)
 	pdb := &policyv1.PodDisruptionBudget{
 		ObjectMeta: metav1.ObjectMeta{Name: "castai-mysts-pdb", Namespace: "default"},
@@ -896,7 +906,7 @@ func TestGarbageCollectOrphanedPDBs_deletesWhenStatefulSetUnderReplicated(t *tes
 	}
 	clientset := fake.NewSimpleClientset(pdb, sts)
 
-	garbageCollectOrphanedPDBs(context.Background(), clientset)
+	garbageCollectOrphanedPDBs(context.Background(), clientset, rt)
 
 	if _, err := clientset.PolicyV1().PodDisruptionBudgets("default").Get(context.Background(), "castai-mysts-pdb", metav1.GetOptions{}); !apierrors.IsNotFound(err) {
 		t.Fatalf("expected under-replicated StatefulSet PDB to be deleted, got err=%v", err)
@@ -904,6 +914,7 @@ func TestGarbageCollectOrphanedPDBs_deletesWhenStatefulSetUnderReplicated(t *tes
 }
 
 func TestGarbageCollectOrphanedPDBs_keepsPDBOnTransientGetError(t *testing.T) {
+	rt := newControllerRuntime()
 	two := int32(2)
 	pdb := &policyv1.PodDisruptionBudget{
 		ObjectMeta: metav1.ObjectMeta{Name: "castai-myapp-pdb", Namespace: "default"},
@@ -927,7 +938,7 @@ func TestGarbageCollectOrphanedPDBs_keepsPDBOnTransientGetError(t *testing.T) {
 		return true, nil, fmt.Errorf("apiserver timeout")
 	})
 
-	garbageCollectOrphanedPDBs(context.Background(), clientset)
+	garbageCollectOrphanedPDBs(context.Background(), clientset, rt)
 
 	if _, err := clientset.PolicyV1().PodDisruptionBudgets("default").Get(context.Background(), "castai-myapp-pdb", metav1.GetOptions{}); err != nil {
 		t.Fatalf("expected PDB to be kept when Deployment Get fails transiently, got err=%v", err)
@@ -935,6 +946,7 @@ func TestGarbageCollectOrphanedPDBs_keepsPDBOnTransientGetError(t *testing.T) {
 }
 
 func TestGarbageCollectOrphanedPDBs_keepsNonCastaiPDB(t *testing.T) {
+	rt := newControllerRuntime()
 	// Helm-managed PDB with no matching Deployment/StatefulSet name derived from
 	// castai naming. GC must leave it alone (ownership guard: castai-*-pdb only).
 	helmPDB := &policyv1.PodDisruptionBudget{
@@ -946,7 +958,7 @@ func TestGarbageCollectOrphanedPDBs_keepsNonCastaiPDB(t *testing.T) {
 	}
 	clientset := fake.NewSimpleClientset(helmPDB)
 
-	garbageCollectOrphanedPDBs(context.Background(), clientset)
+	garbageCollectOrphanedPDBs(context.Background(), clientset, rt)
 
 	if _, err := clientset.PolicyV1().PodDisruptionBudgets("default").Get(context.Background(), "my-helm-pdb", metav1.GetOptions{}); err != nil {
 		t.Fatalf("expected non-castai/Helm PDB to be preserved, got err=%v", err)
@@ -976,6 +988,7 @@ func TestWorkloadHasExistingPDB_listErrorSkipsCreation(t *testing.T) {
 }
 
 func TestCreatePDBForWorkload_createsWhenExistingPDBDoesNotCoverPods(t *testing.T) {
+	rt := newControllerRuntime()
 	resetDefaultPDBConfig()
 	t.Cleanup(resetDefaultPDBConfig)
 
@@ -1005,7 +1018,7 @@ func TestCreatePDBForWorkload_createsWhenExistingPDBDoesNotCoverPods(t *testing.
 		Status: appsv1.DeploymentStatus{ReadyReplicas: 2, AvailableReplicas: 2},
 	}
 
-	createPDBForWorkload(context.Background(), clientset, dep)
+	createPDBForWorkload(context.Background(), clientset, rt, dep)
 
 	if _, err := clientset.PolicyV1().PodDisruptionBudgets("default").Get(context.Background(), "castai-myapp-pdb", metav1.GetOptions{}); err != nil {
 		t.Fatalf("expected castai PDB to be created when pre-existing PDB does not cover pods, got err=%v", err)
@@ -1031,6 +1044,7 @@ func TestWorkloadReadyForNewPDB(t *testing.T) {
 }
 
 func TestCreatePDBForWorkload_skipsWhenWorkloadNotReady(t *testing.T) {
+	rt := newControllerRuntime()
 	resetDefaultPDBConfig()
 	t.Cleanup(resetDefaultPDBConfig)
 
@@ -1048,7 +1062,7 @@ func TestCreatePDBForWorkload_skipsWhenWorkloadNotReady(t *testing.T) {
 	}
 	clientset := fake.NewSimpleClientset()
 
-	createPDBForWorkload(context.Background(), clientset, dep)
+	createPDBForWorkload(context.Background(), clientset, rt, dep)
 
 	pdbs, err := clientset.PolicyV1().PodDisruptionBudgets("default").List(context.Background(), metav1.ListOptions{})
 	if err != nil {
@@ -1060,6 +1074,7 @@ func TestCreatePDBForWorkload_skipsWhenWorkloadNotReady(t *testing.T) {
 }
 
 func TestCreatePDBForWorkload_skipsWhenPartiallyReady(t *testing.T) {
+	rt := newControllerRuntime()
 	resetDefaultPDBConfig()
 	t.Cleanup(resetDefaultPDBConfig)
 
@@ -1077,7 +1092,7 @@ func TestCreatePDBForWorkload_skipsWhenPartiallyReady(t *testing.T) {
 	}
 	clientset := fake.NewSimpleClientset()
 
-	createPDBForWorkload(context.Background(), clientset, dep)
+	createPDBForWorkload(context.Background(), clientset, rt, dep)
 
 	pdbs, err := clientset.PolicyV1().PodDisruptionBudgets("default").List(context.Background(), metav1.ListOptions{})
 	if err != nil {
@@ -1089,6 +1104,7 @@ func TestCreatePDBForWorkload_skipsWhenPartiallyReady(t *testing.T) {
 }
 
 func TestCreatePDBForWorkload_createsWhenFullyReady(t *testing.T) {
+	rt := newControllerRuntime()
 	resetDefaultPDBConfig()
 	t.Cleanup(resetDefaultPDBConfig)
 
@@ -1106,7 +1122,7 @@ func TestCreatePDBForWorkload_createsWhenFullyReady(t *testing.T) {
 	}
 	clientset := fake.NewSimpleClientset()
 
-	createPDBForWorkload(context.Background(), clientset, dep)
+	createPDBForWorkload(context.Background(), clientset, rt, dep)
 
 	if _, err := clientset.PolicyV1().PodDisruptionBudgets("default").Get(context.Background(), "castai-healthy-pdb", metav1.GetOptions{}); err != nil {
 		t.Fatalf("expected PDB when fully ready, got err=%v", err)
@@ -1114,6 +1130,7 @@ func TestCreatePDBForWorkload_createsWhenFullyReady(t *testing.T) {
 }
 
 func TestCreatePDBForWorkload_preservesExistingWhenReadinessDrops(t *testing.T) {
+	rt := newControllerRuntime()
 	resetDefaultPDBConfig()
 	t.Cleanup(resetDefaultPDBConfig)
 
@@ -1138,7 +1155,7 @@ func TestCreatePDBForWorkload_preservesExistingWhenReadinessDrops(t *testing.T) 
 	}
 	clientset := fake.NewSimpleClientset(existing)
 
-	createPDBForWorkload(context.Background(), clientset, dep)
+	createPDBForWorkload(context.Background(), clientset, rt, dep)
 
 	if _, err := clientset.PolicyV1().PodDisruptionBudgets("default").Get(context.Background(), "castai-myapp-pdb", metav1.GetOptions{}); err != nil {
 		t.Fatalf("expected existing castai PDB to be preserved when readiness drops, got err=%v", err)

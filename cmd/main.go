@@ -24,7 +24,6 @@ import (
 	"k8s.io/client-go/dynamic"
 	"k8s.io/client-go/informers"
 	"k8s.io/client-go/kubernetes"
-	appsv1listers "k8s.io/client-go/listers/apps/v1"
 	"k8s.io/client-go/rest"
 	"k8s.io/client-go/tools/cache"
 	"k8s.io/client-go/tools/clientcmd"
@@ -32,33 +31,6 @@ import (
 	"k8s.io/client-go/tools/leaderelection/resourcelock"
 	"sigs.k8s.io/yaml"
 )
-
-// Optional informer listers for cache-local same-name conflict checks.
-// Nil in unit tests → sameNameConflicts falls back to API Get.
-var (
-	workloadListerMu sync.RWMutex
-	deployLister     appsv1listers.DeploymentLister
-	stsLister        appsv1listers.StatefulSetLister
-)
-
-func setWorkloadListers(deploy appsv1listers.DeploymentLister, sts appsv1listers.StatefulSetLister) {
-	workloadListerMu.Lock()
-	defer workloadListerMu.Unlock()
-	deployLister = deploy
-	stsLister = sts
-}
-
-func getDeployLister() appsv1listers.DeploymentLister {
-	workloadListerMu.RLock()
-	defer workloadListerMu.RUnlock()
-	return deployLister
-}
-
-func getSTSLister() appsv1listers.StatefulSetLister {
-	workloadListerMu.RLock()
-	defer workloadListerMu.RUnlock()
-	return stsLister
-}
 
 const (
 	configMapNamespace                   = "castai-agent"
@@ -408,7 +380,7 @@ func pdbSpecNeedsUpdate(existing, desired *policyv1.PodDisruptionBudgetSpec) boo
 }
 
 // updateExistingPDB updates an existing castai PDB with new configuration
-func updateExistingPDB(ctx context.Context, clientset kubernetes.Interface, existingPDB *policyv1.PodDisruptionBudget, workloadAnnotations map[string]string, replicas *int32, namespace, name string, obj interface{}) {
+func updateExistingPDB(ctx context.Context, clientset kubernetes.Interface, rt *controllerRuntime, existingPDB *policyv1.PodDisruptionBudget, workloadAnnotations map[string]string, replicas *int32, namespace, name string, obj interface{}) {
 	if deleteCastaiPDBIfUnderReplicated(ctx, clientset, namespace, name, replicas) {
 		return
 	}
@@ -482,7 +454,7 @@ func updateExistingPDB(ctx context.Context, clientset kubernetes.Interface, exis
 				return
 			}
 			waitForPDBDeletion(ctx, clientset, namespace, existingPDB.Name)
-			createPDBForWorkload(ctx, clientset, obj)
+			createPDBForWorkload(ctx, clientset, rt, obj)
 			return
 		}
 		enrichedSel, err := metav1.LabelSelectorAsSelector(enrichedSelector)
@@ -500,7 +472,7 @@ func updateExistingPDB(ctx context.Context, clientset kubernetes.Interface, exis
 			}
 			logInfof("Deleted PDB %s/%s due to selector change, recreating\n", namespace, name)
 			waitForPDBDeletion(ctx, clientset, namespace, existingPDB.Name)
-			createPDBForWorkload(ctx, clientset, obj)
+			createPDBForWorkload(ctx, clientset, rt, obj)
 			return
 		}
 	}
@@ -516,7 +488,7 @@ func updateExistingPDB(ctx context.Context, clientset kubernetes.Interface, exis
 		} else {
 			logInfof("Updated PDB for %s/%s\n", namespace, name)
 			if replicas != nil {
-				logAndFixPoorPDBConfig(ctx, clientset, existingPDB, name, *replicas, namespace, obj)
+				logAndFixPoorPDBConfig(ctx, clientset, rt, existingPDB, name, *replicas, namespace, obj)
 			}
 		}
 	}
@@ -713,7 +685,7 @@ func dumpCastaiPDBsToFile(ctx context.Context, clientset *kubernetes.Clientset) 
 }
 
 // watches when there are configMap changes
-func watchConfigMap(ctx context.Context, clientset *kubernetes.Clientset) {
+func watchConfigMap(ctx context.Context, clientset *kubernetes.Clientset, rt *controllerRuntime) {
 	factory := informers.NewSharedInformerFactoryWithOptions(
 		clientset,
 		0,
@@ -724,12 +696,12 @@ func watchConfigMap(ctx context.Context, clientset *kubernetes.Clientset) {
 	cmInformer.AddEventHandler(cache.ResourceEventHandlerFuncs{
 		AddFunc: func(obj interface{}) {
 			if cm, ok := obj.(*corev1.ConfigMap); ok && cm.Name == configMapName {
-				updateDefaultPDBConfig(ctx, cm, clientset, true)
+				updateDefaultPDBConfig(ctx, cm, clientset, rt, true)
 			}
 		},
 		UpdateFunc: func(oldObj, newObj interface{}) {
 			if cm, ok := newObj.(*corev1.ConfigMap); ok && cm.Name == configMapName {
-				updateDefaultPDBConfig(ctx, cm, clientset, true)
+				updateDefaultPDBConfig(ctx, cm, clientset, rt, true)
 			}
 		},
 		DeleteFunc: func(obj interface{}) {
@@ -747,7 +719,7 @@ func watchConfigMap(ctx context.Context, clientset *kubernetes.Clientset) {
 // makes necessary updates to default behavior.
 // If reconcile is true, kicks off full reconcile and poor-PDB scan (leader only; see runController).
 // ctx is passed to background reconcile/scans so they stop when the controller shuts down.
-func updateDefaultPDBConfig(ctx context.Context, cm *corev1.ConfigMap, clientset *kubernetes.Clientset, reconcile bool) {
+func updateDefaultPDBConfig(ctx context.Context, cm *corev1.ConfigMap, clientset *kubernetes.Clientset, rt *controllerRuntime, reconcile bool) {
 	syncLogLevelFromData(cm.Data)
 
 	var minAvailable, maxUnavailable *intstr.IntOrString
@@ -868,8 +840,8 @@ func updateDefaultPDBConfig(ctx context.Context, cm *corev1.ConfigMap, clientset
 
 	if reconcile {
 		// Reconcile all PDBs that use defaults (must not run on non-leader replicas)
-		go reconcileAllDefaultPDBs(ctx, clientset)
-		go scanAllPDBsForPoorConfig(ctx, clientset)
+		go reconcileAllDefaultPDBs(ctx, clientset, rt)
+		go scanAllPDBsForPoorConfig(ctx, clientset, rt)
 	}
 }
 
@@ -926,29 +898,30 @@ func loadDefaultPDBConfig(ctx context.Context, clientset *kubernetes.Clientset) 
 		return
 	}
 	logDebugf("Successfully loaded ConfigMap, updating config")
-	updateDefaultPDBConfig(ctx, cm, clientset, false)
+	updateDefaultPDBConfig(ctx, cm, clientset, nil, false)
 }
 
 // Runs the main controller loop to automatically create, update, and delete PodDisruptionBudgets for Deployments and StatefulSets in response to workload events and annotations.
 func runController(ctx context.Context, clientset *kubernetes.Clientset, restConfig *rest.Config) {
+	rt := newControllerRuntime()
 	// ConfigMap watch and initial poor-PDB scan must run only on the leader (GitHub #10).
-	go watchConfigMap(ctx, clientset)
-	go scanAllPDBsForPoorConfig(ctx, clientset)
+	go watchConfigMap(ctx, clientset, rt)
+	go scanAllPDBsForPoorConfig(ctx, clientset, rt)
 
 	factory := informers.NewSharedInformerFactory(clientset, 10*time.Minute)
 
 	deployInformer := factory.Apps().V1().Deployments().Informer()
 	deployInformer.AddEventHandler(cache.ResourceEventHandlerFuncs{
-		AddFunc:    func(obj interface{}) { createPDBForWorkload(ctx, clientset, obj) },
-		UpdateFunc: func(old, new interface{}) { handleWorkloadUpdate(ctx, clientset, old, new) },
-		DeleteFunc: func(obj interface{}) { deletePDBForWorkload(ctx, clientset, obj) },
+		AddFunc:    func(obj interface{}) { createPDBForWorkload(ctx, clientset, rt, obj) },
+		UpdateFunc: func(old, new interface{}) { handleWorkloadUpdate(ctx, clientset, rt, old, new) },
+		DeleteFunc: func(obj interface{}) { deletePDBForWorkload(ctx, clientset, rt, obj) },
 	})
 
 	stsInformer := factory.Apps().V1().StatefulSets().Informer()
 	stsInformer.AddEventHandler(cache.ResourceEventHandlerFuncs{
-		AddFunc:    func(obj interface{}) { createPDBForWorkload(ctx, clientset, obj) },
-		UpdateFunc: func(old, new interface{}) { handleWorkloadUpdate(ctx, clientset, old, new) },
-		DeleteFunc: func(obj interface{}) { deletePDBForWorkload(ctx, clientset, obj) },
+		AddFunc:    func(obj interface{}) { createPDBForWorkload(ctx, clientset, rt, obj) },
+		UpdateFunc: func(old, new interface{}) { handleWorkloadUpdate(ctx, clientset, rt, old, new) },
+		DeleteFunc: func(obj interface{}) { deletePDBForWorkload(ctx, clientset, rt, obj) },
 	})
 
 	var rolloutSynced cache.InformerSynced
@@ -966,7 +939,7 @@ func runController(ctx context.Context, clientset *kubernetes.Clientset, restCon
 		if dynClient, err := dynamic.NewForConfig(restConfig); err != nil {
 			logWarnf("Failed to create dynamic client for Argo Rollouts: %v; continuing without Rollout PDB management", err)
 		} else {
-			rolloutSynced, stopRollouts = maybeStartRolloutInformer(ctx, clientset, dynClient)
+			rolloutSynced, stopRollouts = rt.maybeStartRolloutInformer(ctx, clientset, dynClient)
 		}
 	}
 	defer func() {
@@ -1003,7 +976,7 @@ func runController(ctx context.Context, clientset *kubernetes.Clientset, restCon
 					interval = newInterval
 					logInfof("Updated PDB scan interval to %v", interval)
 				}
-				scanAllPDBsForPoorConfig(ctx, clientset)
+				scanAllPDBsForPoorConfig(ctx, clientset, rt)
 				scanAllPDBsForMultiplePDBs(ctx, clientset)
 				scanAllPDBsForDisruptionBlocks(ctx, clientset)
 			case <-ctx.Done():
@@ -1023,7 +996,7 @@ func runController(ctx context.Context, clientset *kubernetes.Clientset, restCon
 			interval = defaultGarbageCollectInterval
 		}
 
-		garbageCollectOrphanedPDBs(ctx, clientset)
+		garbageCollectOrphanedPDBs(ctx, clientset, rt)
 		ticker := time.NewTicker(interval)
 		defer ticker.Stop()
 		for {
@@ -1038,7 +1011,7 @@ func runController(ctx context.Context, clientset *kubernetes.Clientset, restCon
 					interval = newInterval
 					logInfof("Updated garbage collect interval to %v", interval)
 				}
-				garbageCollectOrphanedPDBs(ctx, clientset)
+				garbageCollectOrphanedPDBs(ctx, clientset, rt)
 			case <-ctx.Done():
 				return
 			}
@@ -1086,7 +1059,7 @@ func runController(ctx context.Context, clientset *kubernetes.Clientset, restCon
 	}
 	// Install listers only after Deploy/STS caches are synced so same-name checks
 	// do not observe an empty cache during startup.
-	setWorkloadListers(factory.Apps().V1().Deployments().Lister(), factory.Apps().V1().StatefulSets().Lister())
+	rt.setWorkloadListers(factory.Apps().V1().Deployments().Lister(), factory.Apps().V1().StatefulSets().Lister())
 
 	// Rollout sync is best-effort: never block Deployment/StatefulSet management.
 	if rolloutSynced != nil {
@@ -1099,18 +1072,18 @@ func runController(ctx context.Context, clientset *kubernetes.Clientset, restCon
 				stopRollouts = nil
 			}
 			stopRolloutsMu.Unlock()
-			disableRolloutInformer()
+			rt.disableRolloutInformer()
 		}
 		cancel()
 	}
 	if restConfig != nil {
-		go retryRolloutInformerPeriodically(ctx, clientset, restConfig, setStopRollouts)
+		go rt.retryRolloutInformerPeriodically(ctx, clientset, restConfig, setStopRollouts)
 	}
 	<-ctx.Done()
 }
 
 // watches for changes to the custom annotations (min, max, and bypass)
-func handleWorkloadUpdate(ctx context.Context, clientset kubernetes.Interface, oldObj, newObj interface{}) {
+func handleWorkloadUpdate(ctx context.Context, clientset kubernetes.Interface, rt *controllerRuntime, oldObj, newObj interface{}) {
 	var oldAnnotations, newAnnotations map[string]string
 	var namespace, name string
 
@@ -1165,7 +1138,7 @@ func handleWorkloadUpdate(ctx context.Context, clientset kubernetes.Interface, o
 	// If bypass annotation is removed, create PDB
 	if oldBypass && !newBypass {
 		logInfof("Bypass annotation removed from %s/%s, creating PDB if needed\n", namespace, name)
-		createPDBForWorkload(ctx, clientset, newObj)
+		createPDBForWorkload(ctx, clientset, rt, newObj)
 		return
 	}
 
@@ -1189,12 +1162,12 @@ func handleWorkloadUpdate(ctx context.Context, clientset kubernetes.Interface, o
 	}
 	if oldMin != newMin || oldMax != newMax {
 		logInfof("PDB annotation changed for %s/%s, updating PDB\n", namespace, name)
-		createPDBForWorkload(ctx, clientset, newObj)
+		createPDBForWorkload(ctx, clientset, rt, newObj)
 		return
 	}
 
 	// For all other updates, run normal logic
-	createPDBForWorkload(ctx, clientset, newObj)
+	createPDBForWorkload(ctx, clientset, rt, newObj)
 }
 
 // selectorMatchesLabelsFull supports both matchLabels and matchExpressions.
@@ -1225,6 +1198,7 @@ func parsePDBValue(input string) *intstr.IntOrString {
 func logAndFixPoorPDBConfig(
 	ctx context.Context,
 	clientset kubernetes.Interface,
+	rt *controllerRuntime,
 	pdb *policyv1.PodDisruptionBudget,
 	workloadName string,
 	replicas int32,
@@ -1296,12 +1270,12 @@ func logAndFixPoorPDBConfig(
 		// Wait for the deletion to propagate before recreating to avoid an AlreadyExists race.
 		waitForPDBDeletion(ctx, clientset, namespace, pdb.Name)
 		// Recreate PDB using the default creation flow for the workload
-		createPDBForWorkload(ctx, clientset, workloadObj)
+		createPDBForWorkload(ctx, clientset, rt, workloadObj)
 	}
 }
 
 // core create PDB workflow
-func createPDBForWorkload(ctx context.Context, clientset kubernetes.Interface, obj interface{}) {
+func createPDBForWorkload(ctx context.Context, clientset kubernetes.Interface, rt *controllerRuntime, obj interface{}) {
 	logDebugf("createPDBForWorkload called for object type %T", obj)
 	var (
 		selector            *metav1.LabelSelector
@@ -1314,7 +1288,7 @@ func createPDBForWorkload(ctx context.Context, clientset kubernetes.Interface, o
 	switch workload := obj.(type) {
 	case *appsv1.Deployment:
 		namespace, name = workload.Namespace, workload.Name
-		if skipSameNameConflict(ctx, clientset, namespace, name, "Deployment") {
+		if skipSameNameConflict(ctx, clientset, rt, namespace, name, "Deployment") {
 			return
 		}
 		replicas = workload.Spec.Replicas
@@ -1338,7 +1312,7 @@ func createPDBForWorkload(ctx context.Context, clientset kubernetes.Interface, o
 		logDebugf("Workload %s/%s is NOT excluded", namespace, name)
 	case *appsv1.StatefulSet:
 		namespace, name = workload.Namespace, workload.Name
-		if skipSameNameConflict(ctx, clientset, namespace, name, "StatefulSet") {
+		if skipSameNameConflict(ctx, clientset, rt, namespace, name, "StatefulSet") {
 			return
 		}
 		replicas = workload.Spec.Replicas
@@ -1362,7 +1336,7 @@ func createPDBForWorkload(ctx context.Context, clientset kubernetes.Interface, o
 		logDebugf("Workload %s/%s is NOT excluded", namespace, name)
 	case *rolloutWorkload:
 		namespace, name = workload.Namespace, workload.Name
-		if skipSameNameConflict(ctx, clientset, namespace, name, "Rollout") {
+		if skipSameNameConflict(ctx, clientset, rt, namespace, name, "Rollout") {
 			return
 		}
 		replicas = workload.Replicas
@@ -1486,7 +1460,7 @@ func createPDBForWorkload(ctx context.Context, clientset kubernetes.Interface, o
 
 	// If a castai PDB exists, update it (do not delete for unreadiness — log via scan).
 	if existingCastaiPDB != nil {
-		updateExistingPDB(ctx, clientset, existingCastaiPDB, workloadAnnotations, replicas, namespace, name, obj)
+		updateExistingPDB(ctx, clientset, rt, existingCastaiPDB, workloadAnnotations, replicas, namespace, name, obj)
 		return
 	}
 
@@ -1619,7 +1593,7 @@ func createPDBForWorkload(ctx context.Context, clientset kubernetes.Interface, o
 					} else {
 						logInfof("Updated PDB for %s/%s\n", namespace, name)
 						if replicas != nil {
-							logAndFixPoorPDBConfig(ctx, clientset, existingPDB, name, *replicas, namespace, obj)
+							logAndFixPoorPDBConfig(ctx, clientset, rt, existingPDB, name, *replicas, namespace, obj)
 						}
 					}
 				}
@@ -1635,7 +1609,7 @@ func createPDBForWorkload(ctx context.Context, clientset kubernetes.Interface, o
 				} else {
 					logInfof("Updated PDB for %s/%s\n", namespace, name)
 					if replicas != nil {
-						logAndFixPoorPDBConfig(ctx, clientset, existingPDB, name, *replicas, namespace, obj)
+						logAndFixPoorPDBConfig(ctx, clientset, rt, existingPDB, name, *replicas, namespace, obj)
 					}
 				}
 			}
@@ -1660,13 +1634,13 @@ func createPDBForWorkload(ctx context.Context, clientset kubernetes.Interface, o
 	} else {
 		logInfof("No existing PDB for %s/%s, created PDB %s\n", namespace, name, pdbName)
 		if replicas != nil {
-			logAndFixPoorPDBConfig(ctx, clientset, pdb, name, *replicas, namespace, obj)
+			logAndFixPoorPDBConfig(ctx, clientset, rt, pdb, name, *replicas, namespace, obj)
 		}
 	}
 }
 
 // Deletes the PodDisruptionBudget associated with a given Deployment, StatefulSet, or Rollout workload.
-func deletePDBForWorkload(ctx context.Context, clientset kubernetes.Interface, obj interface{}) {
+func deletePDBForWorkload(ctx context.Context, clientset kubernetes.Interface, rt *controllerRuntime, obj interface{}) {
 	if tombstone, ok := obj.(cache.DeletedFinalStateUnknown); ok {
 		obj = tombstone.Obj
 	}
@@ -1685,7 +1659,7 @@ func deletePDBForWorkload(ctx context.Context, clientset kubernetes.Interface, o
 	}
 
 	// Another kind may still own castai-<name>-pdb.
-	others, err := sameNameConflicts(ctx, clientset, namespace, name, kind)
+	others, err := sameNameConflicts(ctx, clientset, rt, namespace, name, kind)
 	if err != nil {
 		logWarnf("Not deleting PDB castai-%s-pdb after %s %s/%s removal: cannot confirm name uniqueness: %v",
 			name, kind, namespace, name, err)
@@ -1713,8 +1687,8 @@ func deletePDBForWorkload(ctx context.Context, clientset kubernetes.Interface, o
 // skipSameNameConflict logs and returns true when another managed kind shares namespace/name.
 // Transient API errors are logged but do not skip create/update (only confirmed conflicts do).
 // PDB names are castai-<name>-pdb (kind-agnostic).
-func skipSameNameConflict(ctx context.Context, clientset kubernetes.Interface, namespace, name, selfKind string) bool {
-	others, err := sameNameConflicts(ctx, clientset, namespace, name, selfKind)
+func skipSameNameConflict(ctx context.Context, clientset kubernetes.Interface, rt *controllerRuntime, namespace, name, selfKind string) bool {
+	others, err := sameNameConflicts(ctx, clientset, rt, namespace, name, selfKind)
 	if err != nil {
 		logWarnf("Proceeding with PDB management for %s %s/%s despite name-conflict check error: %v",
 			selfKind, namespace, name, err)
@@ -1731,10 +1705,10 @@ func skipSameNameConflict(ctx context.Context, clientset kubernetes.Interface, n
 // sameNameConflicts returns other managed kinds that share namespace/name with selfKind.
 // Prefer informer listers/stores (cache-local); fall back to API Get when unavailable
 // (unit tests, or Rollout CRD known but informer disabled).
-func sameNameConflicts(ctx context.Context, clientset kubernetes.Interface, namespace, name, selfKind string) ([]string, error) {
+func sameNameConflicts(ctx context.Context, clientset kubernetes.Interface, rt *controllerRuntime, namespace, name, selfKind string) ([]string, error) {
 	others := make([]string, 0, 2)
 	if selfKind != "Deployment" {
-		exists, err := deploymentExistsForConflict(ctx, clientset, namespace, name)
+		exists, err := deploymentExistsForConflict(ctx, clientset, rt, namespace, name)
 		if err != nil {
 			return nil, fmt.Errorf("Deployment %s/%s: %w", namespace, name, err)
 		}
@@ -1743,7 +1717,7 @@ func sameNameConflicts(ctx context.Context, clientset kubernetes.Interface, name
 		}
 	}
 	if selfKind != "StatefulSet" {
-		exists, err := statefulSetExistsForConflict(ctx, clientset, namespace, name)
+		exists, err := statefulSetExistsForConflict(ctx, clientset, rt, namespace, name)
 		if err != nil {
 			return nil, fmt.Errorf("StatefulSet %s/%s: %w", namespace, name, err)
 		}
@@ -1751,8 +1725,8 @@ func sameNameConflicts(ctx context.Context, clientset kubernetes.Interface, name
 			others = append(others, "StatefulSet")
 		}
 	}
-	if selfKind != "Rollout" && rolloutCRDKnown() {
-		exists, err := rolloutExistsForConflict(ctx, namespace, name)
+	if selfKind != "Rollout" && rt.rolloutCRDKnown() {
+		exists, err := rolloutExistsForConflict(ctx, rt, namespace, name)
 		if err != nil {
 			return nil, fmt.Errorf("Rollout %s/%s: %w", namespace, name, err)
 		}
@@ -1763,8 +1737,8 @@ func sameNameConflicts(ctx context.Context, clientset kubernetes.Interface, name
 	return others, nil
 }
 
-func deploymentExistsForConflict(ctx context.Context, clientset kubernetes.Interface, namespace, name string) (bool, error) {
-	if l := getDeployLister(); l != nil {
+func deploymentExistsForConflict(ctx context.Context, clientset kubernetes.Interface, rt *controllerRuntime, namespace, name string) (bool, error) {
+	if l := rt.getDeployLister(); l != nil {
 		_, err := l.Deployments(namespace).Get(name)
 		if err == nil {
 			return true, nil
@@ -1784,8 +1758,8 @@ func deploymentExistsForConflict(ctx context.Context, clientset kubernetes.Inter
 	return false, err
 }
 
-func statefulSetExistsForConflict(ctx context.Context, clientset kubernetes.Interface, namespace, name string) (bool, error) {
-	if l := getSTSLister(); l != nil {
+func statefulSetExistsForConflict(ctx context.Context, clientset kubernetes.Interface, rt *controllerRuntime, namespace, name string) (bool, error) {
+	if l := rt.getSTSLister(); l != nil {
 		_, err := l.StatefulSets(namespace).Get(name)
 		if err == nil {
 			return true, nil
@@ -1805,12 +1779,12 @@ func statefulSetExistsForConflict(ctx context.Context, clientset kubernetes.Inte
 	return false, err
 }
 
-func rolloutExistsForConflict(ctx context.Context, namespace, name string) (bool, error) {
-	if exists, ok := rolloutExistsInStore(namespace, name); ok {
+func rolloutExistsForConflict(ctx context.Context, rt *controllerRuntime, namespace, name string) (bool, error) {
+	if exists, ok := rt.rolloutExistsInStore(namespace, name); ok {
 		return exists, nil
 	}
 	// Informer store unavailable (disabled/sync failed) — bounded API fallback.
-	_, err := getRollout(ctx, namespace, name)
+	_, err := rt.getRollout(ctx, namespace, name)
 	if err == nil {
 		return true, nil
 	}
@@ -1826,7 +1800,7 @@ func rolloutExistsForConflict(ctx context.Context, namespace, name string) (bool
 // event normally deletes the PDB the moment a workload scales down, but if that event is
 // ever missed (controller restart, leader-election gap, etc.) the PDB would otherwise
 // persist indefinitely with 0 allowed disruptions, blocking node drains/rotations.
-func garbageCollectOrphanedPDBs(ctx context.Context, clientset kubernetes.Interface) {
+func garbageCollectOrphanedPDBs(ctx context.Context, clientset kubernetes.Interface, rt *controllerRuntime) {
 	pdbs, err := clientset.PolicyV1().PodDisruptionBudgets("").List(ctx, metav1.ListOptions{})
 	if err != nil {
 		logErrorf("Failed to list PDBs: %v", err)
@@ -1844,10 +1818,10 @@ func garbageCollectOrphanedPDBs(ctx context.Context, clientset kubernetes.Interf
 
 		var rollout *rolloutWorkload
 		var errRollout error
-		if rolloutCRDKnown() {
-			rollout, errRollout = getRollout(ctx, pdb.Namespace, workloadName)
+		if rt.rolloutCRDKnown() {
+			rollout, errRollout = rt.getRollout(ctx, pdb.Namespace, workloadName)
 		} else {
-			errRollout = apierrors.NewNotFound(getRolloutGVR().GroupResource(), workloadName)
+			errRollout = apierrors.NewNotFound(rt.getRolloutGVR().GroupResource(), workloadName)
 		}
 
 		// Transient API errors (timeout, RBAC, etc.) must not be treated as
@@ -1921,7 +1895,7 @@ func maxReplicasPtr(a, b *int32) *int32 {
 }
 
 // Reconcile all workloads that use default PDB config
-func reconcileAllDefaultPDBs(ctx context.Context, clientset kubernetes.Interface) {
+func reconcileAllDefaultPDBs(ctx context.Context, clientset kubernetes.Interface, rt *controllerRuntime) {
 	logDebugf("reconcileAllDefaultPDBs called")
 	namespaces, err := clientset.CoreV1().Namespaces().List(ctx, metav1.ListOptions{})
 	if err != nil {
@@ -1944,7 +1918,7 @@ func reconcileAllDefaultPDBs(ctx context.Context, clientset kubernetes.Interface
 					// Check if PDB already exists before creating
 					if !workloadHasExistingPDB(ctx, clientset, &d) {
 						logDebugf("Reconciliation: No existing PDB for %s/%s, creating PDB", d.Namespace, d.Name)
-						createPDBForWorkload(ctx, clientset, &d)
+						createPDBForWorkload(ctx, clientset, rt, &d)
 					} else {
 						logDebugf("Reconciliation: Existing PDB found for %s/%s, skipping creation", d.Namespace, d.Name)
 					}
@@ -1965,14 +1939,14 @@ func reconcileAllDefaultPDBs(ctx context.Context, clientset kubernetes.Interface
 					s.Spec.Replicas != nil && *s.Spec.Replicas >= 2 {
 					// Check if PDB already exists before creating
 					if !workloadHasExistingPDB(ctx, clientset, &s) {
-						createPDBForWorkload(ctx, clientset, &s)
+						createPDBForWorkload(ctx, clientset, rt, &s)
 					}
 				}
 			}
 		}
 
-		if rolloutCRDKnown() {
-			rollouts, err := listRollouts(ctx, ns.Name)
+		if rt.rolloutCRDKnown() {
+			rollouts, err := rt.listRollouts(ctx, ns.Name)
 			if err != nil {
 				logErrorf("Failed to list Rollouts in namespace %s: %v", ns.Name, err)
 			} else {
@@ -1981,7 +1955,7 @@ func reconcileAllDefaultPDBs(ctx context.Context, clientset kubernetes.Interface
 						!hasBypassAnnotation(r.Annotations) &&
 						r.Replicas != nil && *r.Replicas >= 2 {
 						if !workloadHasExistingPDB(ctx, clientset, r) {
-							createPDBForWorkload(ctx, clientset, r)
+							createPDBForWorkload(ctx, clientset, rt, r)
 						}
 					}
 				}
@@ -2088,7 +2062,7 @@ func hasBypassAnnotation(annotations map[string]string) bool {
 }
 
 // Audits all PodDisruptionBudgets and logs or fixes those with poor configuration for associated workloads.
-func scanAllPDBsForPoorConfig(ctx context.Context, clientset kubernetes.Interface) {
+func scanAllPDBsForPoorConfig(ctx context.Context, clientset kubernetes.Interface, rt *controllerRuntime) {
 	pdbs, err := clientset.PolicyV1().PodDisruptionBudgets("").List(ctx, metav1.ListOptions{})
 	if err != nil {
 		logErrorf("Failed to list PDBs for audit: %v", err)
@@ -2124,14 +2098,14 @@ func scanAllPDBsForPoorConfig(ctx context.Context, clientset kubernetes.Interfac
 				}
 				// Compare selectors for semantic equivalence
 				if pdbSelector.String() == workloadSelector.String() {
-					if skipSameNameConflict(ctx, clientset, deploy.Namespace, deploy.Name, "Deployment") {
+					if skipSameNameConflict(ctx, clientset, rt, deploy.Namespace, deploy.Name, "Deployment") {
 						continue
 					}
 					replicas := int32(1)
 					if deploy.Spec.Replicas != nil {
 						replicas = *deploy.Spec.Replicas
 					}
-					logAndFixPoorPDBConfig(ctx, clientset, &pdb, deploy.Name, replicas, pdb.Namespace, &deploy)
+					logAndFixPoorPDBConfig(ctx, clientset, rt, &pdb, deploy.Name, replicas, pdb.Namespace, &deploy)
 				}
 			}
 		}
@@ -2156,20 +2130,20 @@ func scanAllPDBsForPoorConfig(ctx context.Context, clientset kubernetes.Interfac
 				}
 				// Compare selectors for semantic equivalence
 				if pdbSelector.String() == workloadSelector.String() {
-					if skipSameNameConflict(ctx, clientset, sts.Namespace, sts.Name, "StatefulSet") {
+					if skipSameNameConflict(ctx, clientset, rt, sts.Namespace, sts.Name, "StatefulSet") {
 						continue
 					}
 					replicas := int32(1)
 					if sts.Spec.Replicas != nil {
 						replicas = *sts.Spec.Replicas
 					}
-					logAndFixPoorPDBConfig(ctx, clientset, &pdb, sts.Name, replicas, pdb.Namespace, &sts)
+					logAndFixPoorPDBConfig(ctx, clientset, rt, &pdb, sts.Name, replicas, pdb.Namespace, &sts)
 				}
 			}
 		}
 
-		if rolloutCRDKnown() {
-			rollouts, err := listRollouts(ctx, pdb.Namespace)
+		if rt.rolloutCRDKnown() {
+			rollouts, err := rt.listRollouts(ctx, pdb.Namespace)
 			if err != nil {
 				logErrorf("Failed to list Rollouts in namespace %s: %v", pdb.Namespace, err)
 			} else {
@@ -2183,14 +2157,14 @@ func scanAllPDBsForPoorConfig(ctx context.Context, clientset kubernetes.Interfac
 						continue
 					}
 					if pdbSelector.String() == workloadSelector.String() {
-						if skipSameNameConflict(ctx, clientset, r.Namespace, r.Name, "Rollout") {
+						if skipSameNameConflict(ctx, clientset, rt, r.Namespace, r.Name, "Rollout") {
 							continue
 						}
 						replicas := int32(1)
 						if r.Replicas != nil {
 							replicas = *r.Replicas
 						}
-						logAndFixPoorPDBConfig(ctx, clientset, &pdb, r.Name, replicas, pdb.Namespace, r)
+						logAndFixPoorPDBConfig(ctx, clientset, rt, &pdb, r.Name, replicas, pdb.Namespace, r)
 					}
 				}
 			}

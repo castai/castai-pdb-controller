@@ -4,7 +4,6 @@ import (
 	"context"
 	"fmt"
 	"math"
-	"sync"
 	"time"
 
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
@@ -41,126 +40,6 @@ type rolloutWorkload struct {
 	PodTemplateLabels map[string]string
 	ReadyReplicas     int32
 	AvailableReplicas int32
-}
-
-var (
-	rolloutSupportMu sync.RWMutex
-	rolloutClient    dynamic.Interface
-	rolloutEnabled   bool // informer handlers active
-	rolloutKnown     bool // CRD discovered; GC must not treat Rollouts as absent
-	rolloutStore     cache.Store
-	activeRolloutGVR = schema.GroupVersionResource{
-		Group:    rolloutGroup,
-		Version:  rolloutVersionPreferred,
-		Resource: rolloutResource,
-	}
-)
-
-func setRolloutSupport(client dynamic.Interface, enabled bool) {
-	rolloutSupportMu.Lock()
-	defer rolloutSupportMu.Unlock()
-	if !enabled {
-		rolloutClient = nil
-		rolloutEnabled = false
-		rolloutKnown = false
-		rolloutStore = nil
-		return
-	}
-	rolloutClient = client
-	rolloutEnabled = true
-	rolloutKnown = true
-}
-
-// setRolloutCRDKnown records that the Rollouts API exists but leaves the informer off
-// (e.g. preflight list failed). GC and same-name checks can still use the client.
-func setRolloutCRDKnown(client dynamic.Interface) {
-	rolloutSupportMu.Lock()
-	defer rolloutSupportMu.Unlock()
-	rolloutClient = client
-	rolloutKnown = true
-	rolloutEnabled = false
-	rolloutStore = nil
-}
-
-// disableRolloutInformer keeps the CRD "known" for GC/collision lookups but stops
-// treating the informer as active (e.g. after a sync timeout).
-func disableRolloutInformer() {
-	rolloutSupportMu.Lock()
-	defer rolloutSupportMu.Unlock()
-	rolloutEnabled = false
-	rolloutStore = nil
-}
-
-func setRolloutStore(store cache.Store) {
-	rolloutSupportMu.Lock()
-	defer rolloutSupportMu.Unlock()
-	rolloutStore = store
-}
-
-// rolloutExistsInStore reports (exists, storeAvailable). When storeAvailable is false,
-// callers should fall back to a direct API get (including on GetByKey errors).
-func rolloutExistsInStore(namespace, name string) (exists bool, storeAvailable bool) {
-	rolloutSupportMu.RLock()
-	store := rolloutStore
-	rolloutSupportMu.RUnlock()
-	if store == nil {
-		return false, false
-	}
-	_, exists, err := store.GetByKey(namespace + "/" + name)
-	if err != nil {
-		return false, false
-	}
-	return exists, true
-}
-
-// clearRolloutSupportIfAPIGone disables Rollout support when the API group/version
-// is gone (CRD uninstalled). Object-level NotFound must not clear support.
-func clearRolloutSupportIfAPIGone(err error) {
-	if err == nil || !meta.IsNoMatchError(err) {
-		return
-	}
-	logWarnf("Argo Rollouts API no longer available (%v); disabling Rollout PDB management", err)
-	setRolloutSupport(nil, false)
-}
-
-func rolloutInformerEnabled() bool {
-	rolloutSupportMu.RLock()
-	defer rolloutSupportMu.RUnlock()
-	return rolloutEnabled
-}
-
-func rolloutCRDKnown() bool {
-	rolloutSupportMu.RLock()
-	defer rolloutSupportMu.RUnlock()
-	return rolloutKnown
-}
-
-func getRolloutClient() (dynamic.Interface, bool) {
-	dyn, _, ok := getRolloutClientAndGVR()
-	return dyn, ok
-}
-
-func getRolloutGVR() schema.GroupVersionResource {
-	_, gvr, _ := getRolloutClientAndGVR()
-	return gvr
-}
-
-// getRolloutClientAndGVR returns the dynamic client and GVR under one lock so
-// callers cannot observe a cleared client paired with a stale GVR (or vice versa).
-func getRolloutClientAndGVR() (dynamic.Interface, schema.GroupVersionResource, bool) {
-	rolloutSupportMu.RLock()
-	defer rolloutSupportMu.RUnlock()
-	gvr := activeRolloutGVR
-	if rolloutClient == nil || !rolloutKnown {
-		return nil, gvr, false
-	}
-	return rolloutClient, gvr, true
-}
-
-func setRolloutGVR(gvr schema.GroupVersionResource) {
-	rolloutSupportMu.Lock()
-	defer rolloutSupportMu.Unlock()
-	activeRolloutGVR = gvr
 }
 
 func int64ToInt32(v int64, field string) (int32, error) {
@@ -297,43 +176,51 @@ func rolloutFromInformerObj(obj interface{}) (*rolloutWorkload, error) {
 // maybeStartRolloutInformer enables Rollout watches when the CRD is present and listable.
 // On sync failure the caller should stop the returned cancel and call disableRolloutInformer
 // so GC does not treat Rollouts as absent while the CRD remains installed.
-func maybeStartRolloutInformer(ctx context.Context, clientset kubernetes.Interface, dynClient dynamic.Interface) (cache.InformerSynced, context.CancelFunc) {
+func (rt *controllerRuntime) clearRolloutSupportIfAPIGone(err error) {
+	if err == nil || !meta.IsNoMatchError(err) {
+		return
+	}
+	logWarnf("Argo Rollouts API no longer available (%v); disabling Rollout PDB management", err)
+	rt.setRolloutSupport(nil, false)
+}
+
+func (rt *controllerRuntime) maybeStartRolloutInformer(ctx context.Context, clientset kubernetes.Interface, dynClient dynamic.Interface) (cache.InformerSynced, context.CancelFunc) {
 	gvr, available, err := discoverRolloutGVR(clientset.Discovery())
 	if err != nil {
 		logWarnf("Failed to discover Argo Rollouts API (%s, resource=%s): %v; skipping Rollout PDB management",
 			rolloutGroup, rolloutResource, err)
-		setRolloutSupport(nil, false)
+		rt.setRolloutSupport(nil, false)
 		return nil, nil
 	}
 	if !available {
 		logInfof("Argo Rollouts API (%s, resource=%s) not found; skipping Rollout PDB management",
 			rolloutGroup, rolloutResource)
-		setRolloutSupport(nil, false)
+		rt.setRolloutSupport(nil, false)
 		return nil, nil
 	}
-	setRolloutGVR(gvr)
+	rt.setRolloutGVR(gvr)
 
 	listCtx, cancel := context.WithTimeout(ctx, rolloutListPreflightTO)
 	defer cancel()
 	if _, err := dynClient.Resource(gvr).Namespace(metav1.NamespaceAll).List(listCtx, metav1.ListOptions{Limit: 1}); err != nil {
 		// CRD is installed but list failed (RBAC, timeout). Keep it known so GC/collision
 		// checks do not treat Rollouts as absent; leave the informer disabled.
-		setRolloutCRDKnown(dynClient)
+		rt.setRolloutCRDKnown(dynClient)
 		logWarnf("Argo Rollouts API %s is present but listing Rollouts failed (%v); CRD marked known for GC/collision checks, informer disabled so Deployment/StatefulSet management can proceed",
 			gvr.String(), err)
 		return nil, nil
 	}
 
 	rolloutCtx, stopRollouts := context.WithCancel(ctx)
-	setRolloutSupport(dynClient, true)
+	rt.setRolloutSupport(dynClient, true)
 	logInfof("Argo Rollouts API detected (%s); enabling Rollout PDB management", gvr.String())
 
 	factory := dynamicinformer.NewDynamicSharedInformerFactory(dynClient, 10*time.Minute)
 	informer := factory.ForResource(gvr).Informer()
-	setRolloutStore(informer.GetStore())
+	rt.setRolloutStore(informer.GetStore())
 	informer.AddEventHandler(cache.ResourceEventHandlerFuncs{
 		AddFunc: func(obj interface{}) {
-			if !rolloutInformerEnabled() {
+			if !rt.rolloutInformerEnabled() {
 				return
 			}
 			rw, err := rolloutFromInformerObj(obj)
@@ -341,10 +228,10 @@ func maybeStartRolloutInformer(ctx context.Context, clientset kubernetes.Interfa
 				logWarnf("Failed to parse Rollout on add: %v", err)
 				return
 			}
-			createPDBForWorkload(rolloutCtx, clientset, rw)
+			createPDBForWorkload(rolloutCtx, clientset, rt, rw)
 		},
 		UpdateFunc: func(oldObj, newObj interface{}) {
-			if !rolloutInformerEnabled() {
+			if !rt.rolloutInformerEnabled() {
 				return
 			}
 			oldRW, err := rolloutFromInformerObj(oldObj)
@@ -357,10 +244,10 @@ func maybeStartRolloutInformer(ctx context.Context, clientset kubernetes.Interfa
 				logWarnf("Failed to parse new Rollout on update: %v", err)
 				return
 			}
-			handleWorkloadUpdate(rolloutCtx, clientset, oldRW, newRW)
+			handleWorkloadUpdate(rolloutCtx, clientset, rt, oldRW, newRW)
 		},
 		DeleteFunc: func(obj interface{}) {
-			if !rolloutInformerEnabled() {
+			if !rt.rolloutInformerEnabled() {
 				return
 			}
 			rw, err := rolloutFromInformerObj(obj)
@@ -368,7 +255,7 @@ func maybeStartRolloutInformer(ctx context.Context, clientset kubernetes.Interfa
 				logWarnf("Failed to parse Rollout on delete: %v", err)
 				return
 			}
-			deletePDBForWorkload(rolloutCtx, clientset, rw)
+			deletePDBForWorkload(rolloutCtx, clientset, rt, rw)
 		},
 	})
 	factory.Start(rolloutCtx.Done())
@@ -378,20 +265,20 @@ func maybeStartRolloutInformer(ctx context.Context, clientset kubernetes.Interfa
 // retryRolloutInformerPeriodically restarts the Rollout informer when the CRD is known
 // but the informer was disabled (sync timeout / preflight failure). Tries immediately,
 // then backs off on rolloutInformerRetryInterval until enabled or ctx is cancelled.
-func retryRolloutInformerPeriodically(ctx context.Context, clientset kubernetes.Interface, restConfig *rest.Config, setStop func(context.CancelFunc)) {
+func (rt *controllerRuntime) retryRolloutInformerPeriodically(ctx context.Context, clientset kubernetes.Interface, restConfig *rest.Config, setStop func(context.CancelFunc)) {
 	if restConfig == nil {
 		return
 	}
 	attempt := func() bool {
-		if rolloutInformerEnabled() || !rolloutCRDKnown() {
-			return rolloutInformerEnabled()
+		if rt.rolloutInformerEnabled() || !rt.rolloutCRDKnown() {
+			return rt.rolloutInformerEnabled()
 		}
 		dynClient, err := dynamic.NewForConfig(restConfig)
 		if err != nil {
 			logWarnf("Rollout informer retry: dynamic client failed: %v", err)
 			return false
 		}
-		synced, stop := maybeStartRolloutInformer(ctx, clientset, dynClient)
+		synced, stop := rt.maybeStartRolloutInformer(ctx, clientset, dynClient)
 		if synced == nil {
 			if stop != nil {
 				stop()
@@ -406,7 +293,7 @@ func retryRolloutInformerPeriodically(ctx context.Context, clientset kubernetes.
 			if stop != nil {
 				stop()
 			}
-			disableRolloutInformer()
+			rt.disableRolloutInformer()
 			return false
 		}
 		if setStop != nil {
@@ -435,14 +322,14 @@ func retryRolloutInformerPeriodically(ctx context.Context, clientset kubernetes.
 	}
 }
 
-func listRollouts(ctx context.Context, namespace string) ([]*rolloutWorkload, error) {
-	dyn, gvr, ok := getRolloutClientAndGVR()
+func (rt *controllerRuntime) listRollouts(ctx context.Context, namespace string) ([]*rolloutWorkload, error) {
+	dyn, gvr, ok := rt.getRolloutClientAndGVR()
 	if !ok {
 		return nil, nil
 	}
 	list, err := dyn.Resource(gvr).Namespace(namespace).List(ctx, metav1.ListOptions{})
 	if err != nil {
-		clearRolloutSupportIfAPIGone(err)
+		rt.clearRolloutSupportIfAPIGone(err)
 		return nil, err
 	}
 	out := make([]*rolloutWorkload, 0, len(list.Items))
@@ -457,14 +344,14 @@ func listRollouts(ctx context.Context, namespace string) ([]*rolloutWorkload, er
 	return out, nil
 }
 
-func getRollout(ctx context.Context, namespace, name string) (*rolloutWorkload, error) {
-	dyn, gvr, ok := getRolloutClientAndGVR()
+func (rt *controllerRuntime) getRollout(ctx context.Context, namespace, name string) (*rolloutWorkload, error) {
+	dyn, gvr, ok := rt.getRolloutClientAndGVR()
 	if !ok {
 		return nil, apierrors.NewNotFound(gvr.GroupResource(), name)
 	}
 	u, err := dyn.Resource(gvr).Namespace(namespace).Get(ctx, name, metav1.GetOptions{})
 	if err != nil {
-		clearRolloutSupportIfAPIGone(err)
+		rt.clearRolloutSupportIfAPIGone(err)
 		return nil, err
 	}
 	return parseRolloutWorkload(u)
