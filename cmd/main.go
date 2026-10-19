@@ -21,6 +21,7 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/labels"
 	"k8s.io/apimachinery/pkg/util/intstr"
+	"k8s.io/client-go/dynamic"
 	"k8s.io/client-go/informers"
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/rest"
@@ -30,6 +31,54 @@ import (
 	"k8s.io/client-go/tools/leaderelection/resourcelock"
 	"sigs.k8s.io/yaml"
 )
+
+// workloadView is the common PDB-relevant surface for Deployments, StatefulSets, and Rollouts.
+type workloadView struct {
+	namespace         string
+	name              string
+	replicas          *int32
+	selector          *metav1.LabelSelector
+	annotations       map[string]string
+	labels            map[string]string
+	podTemplateLabels map[string]string
+}
+
+func asWorkloadView(obj interface{}) (workloadView, bool) {
+	switch w := obj.(type) {
+	case *appsv1.Deployment:
+		return workloadView{
+			namespace:         w.Namespace,
+			name:              w.Name,
+			replicas:          w.Spec.Replicas,
+			selector:          w.Spec.Selector,
+			annotations:       w.Annotations,
+			labels:            w.Labels,
+			podTemplateLabels: w.Spec.Template.Labels,
+		}, true
+	case *appsv1.StatefulSet:
+		return workloadView{
+			namespace:         w.Namespace,
+			name:              w.Name,
+			replicas:          w.Spec.Replicas,
+			selector:          w.Spec.Selector,
+			annotations:       w.Annotations,
+			labels:            w.Labels,
+			podTemplateLabels: w.Spec.Template.Labels,
+		}, true
+	case *rolloutWorkload:
+		return workloadView{
+			namespace:         w.Namespace,
+			name:              w.Name,
+			replicas:          w.Replicas,
+			selector:          w.Selector,
+			annotations:       w.Annotations,
+			labels:            w.Labels,
+			podTemplateLabels: w.PodTemplateLabels,
+		}, true
+	default:
+		return workloadView{}, false
+	}
+}
 
 const (
 	configMapNamespace                   = "castai-agent"
@@ -232,8 +281,8 @@ func deleteCastaiPDBIfUnderReplicated(ctx context.Context, clientset kubernetes.
 }
 
 // workloadReplicaHealth reads desired/ready/available replica counts from a
-// Deployment or StatefulSet. StatefulSets have no AvailableReplicas; available
-// is set equal to ready so callers can use one comparison path.
+// Deployment, StatefulSet, or Rollout. StatefulSets have no AvailableReplicas;
+// available is set equal to ready so callers can use one comparison path.
 func workloadReplicaHealth(obj interface{}) (desired, ready, available int32, ok bool) {
 	switch w := obj.(type) {
 	case *appsv1.Deployment:
@@ -248,6 +297,12 @@ func workloadReplicaHealth(obj interface{}) (desired, ready, available int32, ok
 			desired = *w.Spec.Replicas
 		}
 		return desired, w.Status.ReadyReplicas, w.Status.ReadyReplicas, true
+	case *rolloutWorkload:
+		desired = 1
+		if w.Replicas != nil {
+			desired = *w.Replicas
+		}
+		return desired, w.ReadyReplicas, w.AvailableReplicas, true
 	default:
 		return 0, 0, 0, false
 	}
@@ -420,11 +475,8 @@ func updateExistingPDB(ctx context.Context, clientset kubernetes.Interface, exis
 
 	// Enrich selector with additional labels (same as in createPDBForWorkload)
 	var podTemplateLabels map[string]string
-	switch workload := obj.(type) {
-	case *appsv1.Deployment:
-		podTemplateLabels = workload.Spec.Template.Labels
-	case *appsv1.StatefulSet:
-		podTemplateLabels = workload.Spec.Template.Labels
+	if wv, ok := asWorkloadView(obj); ok {
+		podTemplateLabels = wv.podTemplateLabels
 	}
 
 	defaultPDBConfigLock.RLock()
@@ -602,7 +654,7 @@ func main() {
 				// Re-enable logging for the leader pod
 				log.SetOutput(os.Stderr)
 				logInfof("[%s] I am the leader now\n", id)
-				runController(ctx, clientset)
+				runController(ctx, clientset, config)
 			},
 			OnStoppedLeading: func() {
 				logInfof("[%s] Lost leadership, exiting\n", id)
@@ -892,8 +944,9 @@ func loadDefaultPDBConfig(ctx context.Context, clientset *kubernetes.Clientset) 
 	updateDefaultPDBConfig(ctx, cm, clientset, false)
 }
 
-// Runs the main controller loop to automatically create, update, and delete PodDisruptionBudgets for Deployments and StatefulSets in response to workload events and annotations.
-func runController(ctx context.Context, clientset *kubernetes.Clientset) {
+// Runs the main controller loop to automatically create, update, and delete PodDisruptionBudgets
+// for Deployments, StatefulSets, and (when the CRD is installed) Argo Rollouts.
+func runController(ctx context.Context, clientset *kubernetes.Clientset, restConfig *rest.Config) {
 	// ConfigMap watch and initial poor-PDB scan must run only on the leader (GitHub #10).
 	go watchConfigMap(ctx, clientset)
 	go scanAllPDBsForPoorConfig(ctx, clientset)
@@ -913,6 +966,15 @@ func runController(ctx context.Context, clientset *kubernetes.Clientset) {
 		UpdateFunc: func(old, new interface{}) { handleWorkloadUpdate(ctx, clientset, old, new) },
 		DeleteFunc: func(obj interface{}) { deletePDBForWorkload(ctx, clientset, obj) },
 	})
+
+	var rolloutSynced cache.InformerSynced
+	dynClient, err := dynamic.NewForConfig(restConfig)
+	if err != nil {
+		logWarnf("Failed to create dynamic client for Rollout support: %v; skipping Rollout PDB management", err)
+		setRolloutSupport(nil, false)
+	} else {
+		rolloutSynced = maybeStartRolloutInformer(ctx, clientset, dynClient)
+	}
 
 	// Periodically scan for poor and multiple PDBs
 	go func() {
@@ -1016,7 +1078,11 @@ func runController(ctx context.Context, clientset *kubernetes.Clientset) {
 	}()
 
 	factory.Start(ctx.Done())
-	for _, synced := range []cache.InformerSynced{deployInformer.HasSynced, stsInformer.HasSynced} {
+	toSync := []cache.InformerSynced{deployInformer.HasSynced, stsInformer.HasSynced}
+	if rolloutSynced != nil {
+		toSync = append(toSync, rolloutSynced)
+	}
+	for _, synced := range toSync {
 		if !cache.WaitForCacheSync(ctx.Done(), synced) {
 			panic("failed to sync informer cache")
 		}
@@ -1026,25 +1092,15 @@ func runController(ctx context.Context, clientset *kubernetes.Clientset) {
 
 // watches for changes to the custom annotations (min, max, and bypass)
 func handleWorkloadUpdate(ctx context.Context, clientset *kubernetes.Clientset, oldObj, newObj interface{}) {
-	var oldAnnotations, newAnnotations map[string]string
-	var namespace, name string
-
-	switch oldWorkload := oldObj.(type) {
-	case *appsv1.Deployment:
-		oldAnnotations = oldWorkload.Annotations
-		newWorkload := newObj.(*appsv1.Deployment)
-		newAnnotations = newWorkload.Annotations
-		namespace = newWorkload.Namespace
-		name = newWorkload.Name
-	case *appsv1.StatefulSet:
-		oldAnnotations = oldWorkload.Annotations
-		newWorkload := newObj.(*appsv1.StatefulSet)
-		newAnnotations = newWorkload.Annotations
-		namespace = newWorkload.Namespace
-		name = newWorkload.Name
-	default:
+	oldWV, oldOK := asWorkloadView(oldObj)
+	newWV, newOK := asWorkloadView(newObj)
+	if !oldOK || !newOK {
 		return
 	}
+	oldAnnotations := oldWV.annotations
+	newAnnotations := newWV.annotations
+	namespace := newWV.namespace
+	name := newWV.name
 
 	oldBypass := false
 	if oldAnnotations != nil {
@@ -1180,15 +1236,8 @@ func logAndFixPoorPDBConfig(
 
 	// Bypass annotation check
 	if poorConfig && fixPoor && workloadObj != nil {
-		var annotations map[string]string
-		switch w := workloadObj.(type) {
-		case *appsv1.Deployment:
-			annotations = w.Annotations
-		case *appsv1.StatefulSet:
-			annotations = w.Annotations
-		}
-		if annotations != nil {
-			if val, ok := annotations[annotationBypass]; ok && val == "true" {
+		if wv, ok := asWorkloadView(workloadObj); ok && wv.annotations != nil {
+			if val, ok := wv.annotations[annotationBypass]; ok && val == "true" {
 				// Respect bypass annotation: do not delete or recreate PDB
 				return
 			}
@@ -1212,64 +1261,33 @@ func logAndFixPoorPDBConfig(
 // core create PDB workflow
 func createPDBForWorkload(ctx context.Context, clientset kubernetes.Interface, obj interface{}) {
 	logDebugf("createPDBForWorkload called for object type %T", obj)
-	var (
-		selector            *metav1.LabelSelector
-		namespace, name     string
-		workloadAnnotations map[string]string
-		replicas            *int32
-		podTemplateLabels   map[string]string
-	)
-
-	switch workload := obj.(type) {
-	case *appsv1.Deployment:
-		replicas = workload.Spec.Replicas
-		if deleteCastaiPDBIfUnderReplicated(ctx, clientset, workload.Namespace, workload.Name, replicas) {
-			return
-		}
-		if workload.Annotations != nil {
-			if val, ok := workload.Annotations[annotationBypass]; ok && val == "true" {
-				return
-			}
-		}
-		selector = workload.Spec.Selector
-		workloadAnnotations = workload.Annotations
-		namespace = workload.Namespace
-		name = workload.Name
-		podTemplateLabels = workload.Spec.Template.Labels
-
-		// Check if workload should be excluded
-		logDebugf("About to check exclusions for %s/%s", namespace, name)
-		if isWorkloadExcluded(namespace, name, workload.Labels) {
-			logInfof("EXCLUDED: Workload %s/%s is excluded", namespace, name)
-			return
-		}
-		logDebugf("Workload %s/%s is NOT excluded", namespace, name)
-	case *appsv1.StatefulSet:
-		replicas = workload.Spec.Replicas
-		if deleteCastaiPDBIfUnderReplicated(ctx, clientset, workload.Namespace, workload.Name, replicas) {
-			return
-		}
-		if workload.Annotations != nil {
-			if val, ok := workload.Annotations[annotationBypass]; ok && val == "true" {
-				return
-			}
-		}
-		selector = workload.Spec.Selector
-		workloadAnnotations = workload.Annotations
-		namespace = workload.Namespace
-		name = workload.Name
-		podTemplateLabels = workload.Spec.Template.Labels
-
-		// Check if workload should be excluded
-		logDebugf("About to check exclusions for %s/%s", namespace, name)
-		if isWorkloadExcluded(namespace, name, workload.Labels) {
-			logInfof("EXCLUDED: Workload %s/%s is excluded", namespace, name)
-			return
-		}
-		logDebugf("Workload %s/%s is NOT excluded", namespace, name)
-	default:
+	wv, ok := asWorkloadView(obj)
+	if !ok {
 		return
 	}
+
+	replicas := wv.replicas
+	namespace := wv.namespace
+	name := wv.name
+	selector := wv.selector
+	workloadAnnotations := wv.annotations
+	podTemplateLabels := wv.podTemplateLabels
+
+	if deleteCastaiPDBIfUnderReplicated(ctx, clientset, namespace, name, replicas) {
+		return
+	}
+	if workloadAnnotations != nil {
+		if val, ok := workloadAnnotations[annotationBypass]; ok && val == "true" {
+			return
+		}
+	}
+
+	logDebugf("About to check exclusions for %s/%s", namespace, name)
+	if isWorkloadExcluded(namespace, name, wv.labels) {
+		logInfof("EXCLUDED: Workload %s/%s is excluded", namespace, name)
+		return
+	}
+	logDebugf("Workload %s/%s is NOT excluded", namespace, name)
 
 	if selector == nil {
 		return
@@ -1547,21 +1565,14 @@ func createPDBForWorkload(ctx context.Context, clientset kubernetes.Interface, o
 	}
 }
 
-// Deletes the PodDisruptionBudget associated with a given Deployment or StatefulSet workload.
+// Deletes the PodDisruptionBudget associated with a given Deployment, StatefulSet, or Rollout workload.
 func deletePDBForWorkload(ctx context.Context, clientset *kubernetes.Clientset, obj interface{}) {
-	var namespace, name string
-
-	switch workload := obj.(type) {
-	case *appsv1.Deployment:
-		namespace = workload.Namespace
-		name = workload.Name
-	case *appsv1.StatefulSet:
-		namespace = workload.Namespace
-		name = workload.Name
-	default:
+	wv, ok := asWorkloadView(obj)
+	if !ok {
 		logWarnf("deletePDBForWorkload: unsupported workload type %T", obj)
 		return
 	}
+	namespace, name := wv.namespace, wv.name
 
 	pdbName := fmt.Sprintf("castai-%s-pdb", name)
 	err := clientset.PolicyV1().PodDisruptionBudgets(namespace).Delete(ctx, pdbName, metav1.DeleteOptions{})
@@ -1576,11 +1587,12 @@ func deletePDBForWorkload(ctx context.Context, clientset *kubernetes.Clientset, 
 	}
 }
 
-// Deletes orphaned PodDisruptionBudgets that no longer have an associated Deployment or StatefulSet,
-// and PodDisruptionBudgets whose workload still exists but has dropped below 2 replicas. The latter
-// case is a self-healing safety net: a live watch event normally deletes the PDB the moment a workload
-// scales down, but if that event is ever missed (controller restart, leader-election gap, etc.) the PDB
-// would otherwise persist indefinitely with 0 allowed disruptions, blocking node drains/rotations.
+// Deletes orphaned PodDisruptionBudgets that no longer have an associated Deployment,
+// StatefulSet, or Rollout, and PodDisruptionBudgets whose workload still exists but has
+// dropped below 2 replicas. The latter case is a self-healing safety net: a live watch
+// event normally deletes the PDB the moment a workload scales down, but if that event is
+// ever missed (controller restart, leader-election gap, etc.) the PDB would otherwise
+// persist indefinitely with 0 allowed disruptions, blocking node drains/rotations.
 func garbageCollectOrphanedPDBs(ctx context.Context, clientset kubernetes.Interface) {
 	pdbs, err := clientset.PolicyV1().PodDisruptionBudgets("").List(ctx, metav1.ListOptions{})
 	if err != nil {
@@ -1594,9 +1606,17 @@ func garbageCollectOrphanedPDBs(ctx context.Context, clientset kubernetes.Interf
 		}
 		workloadName := strings.TrimSuffix(strings.TrimPrefix(pdb.Name, "castai-"), "-pdb")
 
-		// Check for existence of Deployment and StatefulSet
+		// Check for existence of Deployment, StatefulSet, and (when enabled) Rollout
 		deploy, errDep := clientset.AppsV1().Deployments(pdb.Namespace).Get(ctx, workloadName, metav1.GetOptions{})
 		sts, errSts := clientset.AppsV1().StatefulSets(pdb.Namespace).Get(ctx, workloadName, metav1.GetOptions{})
+
+		var rollout *rolloutWorkload
+		var errRollout error
+		if _, rolloutsOn := getRolloutSupport(); rolloutsOn {
+			rollout, errRollout = getRollout(ctx, pdb.Namespace, workloadName)
+		} else {
+			errRollout = apierrors.NewNotFound(rolloutGVR.GroupResource(), workloadName)
+		}
 
 		// Transient API errors (timeout, RBAC, etc.) must not be treated as
 		// "under-replicated" — that would delete PDBs that should be kept.
@@ -1608,8 +1628,12 @@ func garbageCollectOrphanedPDBs(ctx context.Context, clientset kubernetes.Interf
 			logErrorf("Failed to get StatefulSet %s/%s while GC'ing PDB %s: %v", pdb.Namespace, workloadName, pdb.Name, errSts)
 			continue
 		}
+		if errRollout != nil && !apierrors.IsNotFound(errRollout) {
+			logErrorf("Failed to get Rollout %s/%s while GC'ing PDB %s: %v", pdb.Namespace, workloadName, pdb.Name, errRollout)
+			continue
+		}
 
-		if apierrors.IsNotFound(errDep) && apierrors.IsNotFound(errSts) {
+		if apierrors.IsNotFound(errDep) && apierrors.IsNotFound(errSts) && apierrors.IsNotFound(errRollout) {
 			err := clientset.PolicyV1().PodDisruptionBudgets(pdb.Namespace).Delete(ctx, pdb.Name, metav1.DeleteOptions{})
 			if err != nil {
 				if apierrors.IsNotFound(err) {
@@ -1628,8 +1652,10 @@ func garbageCollectOrphanedPDBs(ctx context.Context, clientset kubernetes.Interf
 		var replicas *int32
 		if errDep == nil {
 			replicas = deploy.Spec.Replicas
-		} else {
+		} else if errSts == nil {
 			replicas = sts.Spec.Replicas
+		} else if rollout != nil {
+			replicas = rollout.Replicas
 		}
 		if replicas == nil || *replicas < 2 {
 			err := clientset.PolicyV1().PodDisruptionBudgets(pdb.Namespace).Delete(ctx, pdb.Name, metav1.DeleteOptions{})
@@ -1696,32 +1722,36 @@ func reconcileAllDefaultPDBs(ctx context.Context, clientset *kubernetes.Clientse
 				}
 			}
 		}
+
+		// Check Rollouts (no-op when CRD is not installed / support disabled)
+		rollouts, err := listRollouts(ctx, ns.Name)
+		if err != nil {
+			logErrorf("Failed to list Rollouts in namespace %s: %v", ns.Name, err)
+		} else {
+			for _, r := range rollouts {
+				if !hasCustomPDBAnnotations(r.Annotations) &&
+					!hasBypassAnnotation(r.Annotations) &&
+					r.Replicas != nil && *r.Replicas >= 2 {
+					if !workloadHasExistingPDB(ctx, clientset, r) {
+						createPDBForWorkload(ctx, clientset, r)
+					}
+				}
+			}
+		}
 	}
 }
 
 // workloadHasExistingPDB checks if a workload already has an existing PDB
 func workloadHasExistingPDB(ctx context.Context, clientset kubernetes.Interface, obj interface{}) bool {
-	var selector *metav1.LabelSelector
-	var namespace, name string
-	var workloadLabels map[string]string
-	var podTemplateLabels map[string]string
-
-	switch workload := obj.(type) {
-	case *appsv1.Deployment:
-		selector = workload.Spec.Selector
-		namespace = workload.Namespace
-		name = workload.Name
-		workloadLabels = workload.Labels
-		podTemplateLabels = workload.Spec.Template.Labels
-	case *appsv1.StatefulSet:
-		selector = workload.Spec.Selector
-		namespace = workload.Namespace
-		name = workload.Name
-		workloadLabels = workload.Labels
-		podTemplateLabels = workload.Spec.Template.Labels
-	default:
+	wv, ok := asWorkloadView(obj)
+	if !ok {
 		return false
 	}
+	selector := wv.selector
+	namespace := wv.namespace
+	name := wv.name
+	workloadLabels := wv.labels
+	podTemplateLabels := wv.podTemplateLabels
 
 	// Check if workload should be excluded
 	logDebugf("Reconciliation: Checking exclusions for %s/%s", namespace, name)
@@ -1864,6 +1894,33 @@ func scanAllPDBsForPoorConfig(ctx context.Context, clientset *kubernetes.Clients
 				}
 			}
 		}
+
+		// Check Rollouts (no-op when CRD is not installed / support disabled)
+		rollouts, err := listRollouts(ctx, pdb.Namespace)
+		if err != nil {
+			logErrorf("Failed to list Rollouts in namespace %s: %v", pdb.Namespace, err)
+		} else {
+			for _, r := range rollouts {
+				if r.Annotations != nil && r.Annotations[annotationBypass] == "true" {
+					continue
+				}
+				if r.Selector == nil {
+					continue
+				}
+				workloadSelector, err := metav1.LabelSelectorAsSelector(r.Selector)
+				if err != nil {
+					logWarnf("Invalid selector for Rollout %s/%s: %v", r.Namespace, r.Name, err)
+					continue
+				}
+				if pdbSelector.String() == workloadSelector.String() {
+					replicas := int32(1)
+					if r.Replicas != nil {
+						replicas = *r.Replicas
+					}
+					logAndFixPoorPDBConfig(ctx, clientset, &pdb, r.Name, replicas, pdb.Namespace, r)
+				}
+			}
+		}
 	}
 }
 
@@ -1988,6 +2045,15 @@ func scanAllPDBsForMultiplePDBs(ctx context.Context, clientset kubernetes.Interf
 		} else {
 			for i := range statefulsets.Items {
 				cleanupMultiplePDBsForWorkload(ctx, clientset, namespace, "statefulset", statefulsets.Items[i].Name, statefulsets.Items[i].Annotations, statefulsets.Items[i].Spec.Template.Labels, pdbList.Items)
+			}
+		}
+
+		rollouts, err := listRollouts(ctx, namespace)
+		if err != nil {
+			logErrorf("Failed to list Rollouts in namespace %s: %v", namespace, err)
+		} else {
+			for _, r := range rollouts {
+				cleanupMultiplePDBsForWorkload(ctx, clientset, namespace, "rollout", r.Name, r.Annotations, r.PodTemplateLabels, pdbList.Items)
 			}
 		}
 	}

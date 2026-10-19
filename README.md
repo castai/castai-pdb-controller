@@ -1,6 +1,6 @@
 ## CAST AI PDB Controller
 
-A custom Kubernetes controller that automatically manages [PodDisruptionBudgets (PDBs)](https://kubernetes.io/docs/tasks/run-application/configure-pdb/) for Deployments and StatefulSets using flexible, annotation-driven configuration.  
+A custom Kubernetes controller that automatically manages [PodDisruptionBudgets (PDBs)](https://kubernetes.io/docs/tasks/run-application/configure-pdb/) for Deployments, StatefulSets, and Argo Rollouts (when the Rollouts CRD is installed) using flexible, annotation-driven configuration.  
 This controller enables safe, automated disruption management with per-workload overrides and cluster-wide defaults.
 
 ---
@@ -8,7 +8,7 @@ This controller enables safe, automated disruption management with per-workload 
 ## Features
 
 - **Automatic PDB Creation/Update:**  
-  Ensures every eligible Deployment/StatefulSet has a PDB, using defaults or per-workload overrides.
+  Ensures every eligible Deployment/StatefulSet/Rollout has a PDB, using defaults or per-workload overrides.
 
 - **Annotation-Based Customization:**  
   Users can set `minAvailable`, `maxUnavailable`, or opt out of PDB management with annotations.
