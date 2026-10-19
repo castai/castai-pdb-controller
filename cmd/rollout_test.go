@@ -13,8 +13,10 @@ import (
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/util/intstr"
+	fakediscovery "k8s.io/client-go/discovery/fake"
 	dynamicfake "k8s.io/client-go/dynamic/fake"
 	"k8s.io/client-go/kubernetes/fake"
+	clienttesting "k8s.io/client-go/testing"
 )
 
 func TestParseRolloutWorkload(t *testing.T) {
@@ -421,6 +423,104 @@ func TestListRollouts_noopWhenSupportDisabled(t *testing.T) {
 	}
 	if got != nil {
 		t.Fatalf("expected nil list when disabled, got %d items", len(got))
+	}
+}
+
+func TestDiscoverRolloutGVR_prefersV1Alpha1(t *testing.T) {
+	t.Parallel()
+	fd := &fakediscovery.FakeDiscovery{Fake: &clienttesting.Fake{}}
+	fd.Resources = []*metav1.APIResourceList{{
+		GroupVersion: "argoproj.io/v1alpha1",
+		APIResources: []metav1.APIResource{{Name: "rollouts", Kind: "Rollout", Namespaced: true}},
+	}}
+	gvr, ok, err := discoverRolloutGVR(fd)
+	if err != nil || !ok {
+		t.Fatalf("expected found, got ok=%v err=%v", ok, err)
+	}
+	if gvr.Group != rolloutGroup || gvr.Version != rolloutVersionPreferred || gvr.Resource != rolloutResource {
+		t.Fatalf("unexpected gvr: %#v", gvr)
+	}
+}
+
+func TestDiscoverRolloutGVR_fallbackOtherVersion(t *testing.T) {
+	t.Parallel()
+	fd := &fakediscovery.FakeDiscovery{Fake: &clienttesting.Fake{}}
+	fd.Resources = []*metav1.APIResourceList{{
+		GroupVersion: "argoproj.io/v1beta1",
+		APIResources: []metav1.APIResource{{Name: "rollouts", Kind: "Rollout", Namespaced: true}},
+	}}
+	gvr, ok, err := discoverRolloutGVR(fd)
+	if err != nil || !ok {
+		t.Fatalf("expected fallback found, got ok=%v err=%v", ok, err)
+	}
+	if gvr.Version != "v1beta1" {
+		t.Fatalf("expected v1beta1 fallback, got %#v", gvr)
+	}
+}
+
+func TestDiscoverRolloutGVR_missing(t *testing.T) {
+	t.Parallel()
+	fd := &fakediscovery.FakeDiscovery{Fake: &clienttesting.Fake{}}
+	gvr, ok, err := discoverRolloutGVR(fd)
+	if err != nil {
+		t.Fatalf("unexpected err: %v", err)
+	}
+	if ok || gvr.Resource != "" {
+		t.Fatalf("expected missing, got ok=%v gvr=%#v", ok, gvr)
+	}
+}
+
+func TestMaybeStartRolloutInformer_skipsWhenAPIMissing(t *testing.T) {
+	t.Cleanup(func() { setRolloutSupport(nil, false) })
+	clientset := fake.NewSimpleClientset()
+	dyn := dynamicfake.NewSimpleDynamicClient(runtime.NewScheme())
+	synced, stop := maybeStartRolloutInformer(context.Background(), clientset, dyn)
+	if synced != nil || stop != nil {
+		t.Fatalf("expected nil sync/stop when API missing, got synced=%v stop=%v", synced != nil, stop != nil)
+	}
+	if _, ok := getRolloutSupport(); ok {
+		t.Fatal("support should remain disabled")
+	}
+}
+
+func TestMaybeStartRolloutInformer_startsAndStopDisablesCleanly(t *testing.T) {
+	t.Cleanup(func() { setRolloutSupport(nil, false) })
+
+	clientset := fake.NewSimpleClientset()
+	disco := clientset.Discovery().(*fakediscovery.FakeDiscovery)
+	disco.Resources = []*metav1.APIResourceList{{
+		GroupVersion: "argoproj.io/v1alpha1",
+		APIResources: []metav1.APIResource{{
+			Name: "rollouts", Kind: "Rollout", Namespaced: true,
+			Verbs: []string{"get", "list", "watch"},
+		}},
+	}}
+	u := newUnstructuredRollout("default", "canary-api", 2,
+		map[string]string{"app": "canary-api"},
+		map[string]string{"app": "canary-api"},
+		2, 2,
+	)
+	dyn := dynamicfake.NewSimpleDynamicClientWithCustomListKinds(
+		runtime.NewScheme(),
+		map[schema.GroupVersionResource]string{getRolloutGVR(): "RolloutList"},
+		u,
+	)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	synced, stop := maybeStartRolloutInformer(ctx, clientset, dyn)
+	if synced == nil || stop == nil {
+		t.Fatal("expected informer sync func and stop cancel")
+	}
+	if _, ok := getRolloutSupport(); !ok {
+		t.Fatal("expected Rollout support enabled after successful start")
+	}
+
+	// Mimic sync-timeout recovery: disable support then stop informer.
+	setRolloutSupport(nil, false)
+	stop()
+	if _, ok := getRolloutSupport(); ok {
+		t.Fatal("expected support disabled after stop path")
 	}
 }
 

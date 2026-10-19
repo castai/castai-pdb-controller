@@ -192,21 +192,23 @@ func rolloutFromInformerObj(obj interface{}) (*rolloutWorkload, error) {
 
 // maybeStartRolloutInformer checks for the Rollouts API and, when usable, watches Rollouts
 // with the same PDB create/update/delete handlers used for Deployments/StatefulSets.
-// Returns the informer's HasSynced func when started, or nil when Rollouts are unavailable.
+// On success it returns (HasSynced, stop) where stop cancels the Rollout informer context.
+// Callers must invoke stop if they later disable Rollout support (e.g. sync timeout) so
+// handlers cannot keep mutating PDBs while GC treats Rollouts as absent.
 // A failed list preflight (e.g. missing RBAC) disables Rollouts instead of blocking startup.
-func maybeStartRolloutInformer(ctx context.Context, clientset *kubernetes.Clientset, dynClient dynamic.Interface) cache.InformerSynced {
+func maybeStartRolloutInformer(ctx context.Context, clientset kubernetes.Interface, dynClient dynamic.Interface) (cache.InformerSynced, context.CancelFunc) {
 	gvr, available, err := discoverRolloutGVR(clientset.Discovery())
 	if err != nil {
 		logWarnf("Failed to discover Argo Rollouts API (%s, resource=%s): %v; skipping Rollout PDB management",
 			rolloutGroup, rolloutResource, err)
 		setRolloutSupport(nil, false)
-		return nil
+		return nil, nil
 	}
 	if !available {
 		logInfof("Argo Rollouts API (%s, resource=%s) not found; skipping Rollout PDB management",
 			rolloutGroup, rolloutResource)
 		setRolloutSupport(nil, false)
-		return nil
+		return nil, nil
 	}
 	setRolloutGVR(gvr)
 
@@ -218,8 +220,11 @@ func maybeStartRolloutInformer(ctx context.Context, clientset *kubernetes.Client
 		logWarnf("Argo Rollouts API %s is present but listing Rollouts failed (%v); skipping Rollout PDB management so Deployment/StatefulSet management can proceed",
 			gvr.String(), err)
 		setRolloutSupport(nil, false)
-		return nil
+		return nil, nil
 	}
+
+	// Child context so Rollout informers can be stopped independently of the main controller.
+	rolloutCtx, stopRollouts := context.WithCancel(ctx)
 
 	setRolloutSupport(dynClient, true)
 	logInfof("Argo Rollouts API detected (%s); enabling Rollout PDB management", gvr.String())
@@ -228,14 +233,20 @@ func maybeStartRolloutInformer(ctx context.Context, clientset *kubernetes.Client
 	informer := factory.ForResource(gvr).Informer()
 	informer.AddEventHandler(cache.ResourceEventHandlerFuncs{
 		AddFunc: func(obj interface{}) {
+			if _, ok := getRolloutSupport(); !ok {
+				return
+			}
 			rw, err := rolloutFromInformerObj(obj)
 			if err != nil {
 				logWarnf("Failed to parse Rollout on add: %v", err)
 				return
 			}
-			createPDBForWorkload(ctx, clientset, rw)
+			createPDBForWorkload(rolloutCtx, clientset, rw)
 		},
 		UpdateFunc: func(oldObj, newObj interface{}) {
+			if _, ok := getRolloutSupport(); !ok {
+				return
+			}
 			oldRW, err := rolloutFromInformerObj(oldObj)
 			if err != nil {
 				logWarnf("Failed to parse old Rollout on update: %v", err)
@@ -246,19 +257,22 @@ func maybeStartRolloutInformer(ctx context.Context, clientset *kubernetes.Client
 				logWarnf("Failed to parse new Rollout on update: %v", err)
 				return
 			}
-			handleWorkloadUpdate(ctx, clientset, oldRW, newRW)
+			handleWorkloadUpdate(rolloutCtx, clientset, oldRW, newRW)
 		},
 		DeleteFunc: func(obj interface{}) {
+			if _, ok := getRolloutSupport(); !ok {
+				return
+			}
 			rw, err := rolloutFromInformerObj(obj)
 			if err != nil {
 				logWarnf("Failed to parse Rollout on delete: %v", err)
 				return
 			}
-			deletePDBForWorkload(ctx, clientset, rw)
+			deletePDBForWorkload(rolloutCtx, clientset, rw)
 		},
 	})
-	factory.Start(ctx.Done())
-	return informer.HasSynced
+	factory.Start(rolloutCtx.Done())
+	return informer.HasSynced, stopRollouts
 }
 
 func listRollouts(ctx context.Context, namespace string) ([]*rolloutWorkload, error) {

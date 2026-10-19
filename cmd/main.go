@@ -968,13 +968,16 @@ func runController(ctx context.Context, clientset *kubernetes.Clientset, restCon
 		DeleteFunc: func(obj interface{}) { deletePDBForWorkload(ctx, clientset, obj) },
 	})
 
-	var rolloutSynced cache.InformerSynced
+	var (
+		rolloutSynced cache.InformerSynced
+		stopRollouts  context.CancelFunc
+	)
 	dynClient, err := dynamic.NewForConfig(restConfig)
 	if err != nil {
 		logWarnf("Failed to create dynamic client for Rollout support: %v; skipping Rollout PDB management", err)
 		setRolloutSupport(nil, false)
 	} else {
-		rolloutSynced = maybeStartRolloutInformer(ctx, clientset, dynClient)
+		rolloutSynced, stopRollouts = maybeStartRolloutInformer(ctx, clientset, dynClient)
 	}
 
 	// Periodically scan for poor and multiple PDBs
@@ -1092,10 +1095,18 @@ func runController(ctx context.Context, clientset *kubernetes.Clientset, restCon
 		cancel()
 		if !ok {
 			logWarnf("Timed out waiting for Rollout informer sync; disabling Rollout PDB management so Deployment/StatefulSet management continues")
+			// Disable first so in-flight handlers that check getRolloutSupport() no-op,
+			// then cancel the Rollout informer context so factory goroutines stop.
 			setRolloutSupport(nil, false)
+			if stopRollouts != nil {
+				stopRollouts()
+			}
 		}
 	}
 	<-ctx.Done()
+	if stopRollouts != nil {
+		stopRollouts()
+	}
 }
 
 // watches for changes to the custom annotations (min, max, and bypass)
