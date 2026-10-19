@@ -501,6 +501,87 @@ func TestRolloutExistsInStore_errorFallsBack(t *testing.T) {
 	}
 }
 
+func TestGarbageCollectOrphanedPDBs_usesDeployListerNotAPIGet(t *testing.T) {
+	rt := newControllerRuntime()
+	t.Cleanup(func() {
+		rt.setWorkloadListers(nil, nil)
+		rt.setRolloutSupport(nil, false)
+	})
+
+	two := int32(2)
+	pdb := &policyv1.PodDisruptionBudget{
+		ObjectMeta: metav1.ObjectMeta{Name: "castai-myapp-pdb", Namespace: "default"},
+		Spec: policyv1.PodDisruptionBudgetSpec{
+			Selector:     &metav1.LabelSelector{MatchLabels: map[string]string{"app": "myapp"}},
+			MinAvailable: &intstr.IntOrString{Type: intstr.Int, IntVal: 1},
+		},
+	}
+	dep := &appsv1.Deployment{
+		ObjectMeta: metav1.ObjectMeta{Name: "myapp", Namespace: "default"},
+		Spec:       appsv1.DeploymentSpec{Replicas: &two},
+	}
+	depIndexer := cache.NewIndexer(cache.MetaNamespaceKeyFunc, cache.Indexers{
+		cache.NamespaceIndex: cache.MetaNamespaceIndexFunc,
+	})
+	stsIndexer := cache.NewIndexer(cache.MetaNamespaceKeyFunc, cache.Indexers{
+		cache.NamespaceIndex: cache.MetaNamespaceIndexFunc,
+	})
+	if err := depIndexer.Add(dep); err != nil {
+		t.Fatal(err)
+	}
+	rt.setWorkloadListers(appsv1listers.NewDeploymentLister(depIndexer), appsv1listers.NewStatefulSetLister(stsIndexer))
+
+	clientset := fake.NewSimpleClientset(pdb)
+	clientset.Fake.PrependReactor("get", "deployments", func(action clienttesting.Action) (bool, runtime.Object, error) {
+		t.Fatal("GC must not call Deployment API Get when lister is set")
+		return true, nil, nil
+	})
+	clientset.Fake.PrependReactor("get", "statefulsets", func(action clienttesting.Action) (bool, runtime.Object, error) {
+		t.Fatal("GC must not call StatefulSet API Get when lister is set")
+		return true, nil, nil
+	})
+
+	garbageCollectOrphanedPDBs(context.Background(), clientset, rt)
+	if _, err := clientset.PolicyV1().PodDisruptionBudgets("default").Get(context.Background(), "castai-myapp-pdb", metav1.GetOptions{}); err != nil {
+		t.Fatalf("expected PDB kept via lister replicas: %v", err)
+	}
+}
+
+func TestGarbageCollectOrphanedPDBs_usesRolloutStoreHit(t *testing.T) {
+	rt := newControllerRuntime()
+	t.Cleanup(func() { rt.setRolloutSupport(nil, false) })
+
+	pdb := &policyv1.PodDisruptionBudget{
+		ObjectMeta: metav1.ObjectMeta{Name: "castai-canary-pdb", Namespace: "default"},
+		Spec: policyv1.PodDisruptionBudgetSpec{
+			Selector:     &metav1.LabelSelector{MatchLabels: map[string]string{"app": "canary"}},
+			MinAvailable: &intstr.IntOrString{Type: intstr.Int, IntVal: 1},
+		},
+	}
+	clientset := fake.NewSimpleClientset(pdb)
+	u := newUnstructuredRollout("default", "canary", 2,
+		map[string]string{"app": "canary"},
+		map[string]string{"app": "canary"},
+		2, 2,
+	)
+	// Empty dynamic client: store hit must satisfy GC without API Get.
+	dyn := dynamicfake.NewSimpleDynamicClientWithCustomListKinds(
+		runtime.NewScheme(),
+		map[schema.GroupVersionResource]string{rt.getRolloutGVR(): "RolloutList"},
+	)
+	rt.setRolloutSupport(dyn, true)
+	store := cache.NewStore(cache.MetaNamespaceKeyFunc)
+	if err := store.Add(u); err != nil {
+		t.Fatal(err)
+	}
+	rt.setRolloutStore(store)
+
+	garbageCollectOrphanedPDBs(context.Background(), clientset, rt)
+	if _, err := clientset.PolicyV1().PodDisruptionBudgets("default").Get(context.Background(), "castai-canary-pdb", metav1.GetOptions{}); err != nil {
+		t.Fatalf("expected PDB kept via Rollout store hit: %v", err)
+	}
+}
+
 func TestRolloutExistsForConflict_storeMissFallsBackToAPI(t *testing.T) {
 	rt := newControllerRuntime()
 	t.Cleanup(func() { rt.setRolloutSupport(nil, false) })

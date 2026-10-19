@@ -839,9 +839,13 @@ func updateDefaultPDBConfig(ctx context.Context, cm *corev1.ConfigMap, clientset
 	}
 
 	if reconcile {
-		// Reconcile all PDBs that use defaults (must not run on non-leader replicas)
-		go reconcileAllDefaultPDBs(ctx, clientset, rt)
-		go scanAllPDBsForPoorConfig(ctx, clientset, rt)
+		if rt == nil {
+			logWarnf("reconcile requested with nil controllerRuntime; skipping reconcile/scan")
+		} else {
+			// Reconcile all PDBs that use defaults (must not run on non-leader replicas)
+			go reconcileAllDefaultPDBs(ctx, clientset, rt)
+			go scanAllPDBsForPoorConfig(ctx, clientset, rt)
+		}
 	}
 }
 
@@ -898,7 +902,9 @@ func loadDefaultPDBConfig(ctx context.Context, clientset *kubernetes.Clientset) 
 		return
 	}
 	logDebugf("Successfully loaded ConfigMap, updating config")
-	updateDefaultPDBConfig(ctx, cm, clientset, nil, false)
+	// Pre-leader load never reconciles; pass an empty runtime so updateDefaultPDBConfig
+	// never observes a nil dependency.
+	updateDefaultPDBConfig(ctx, cm, clientset, newControllerRuntime(), false)
 }
 
 // Runs the main controller loop to automatically create, update, and delete PodDisruptionBudgets for Deployments and StatefulSets in response to workload events and annotations.
@@ -1815,13 +1821,13 @@ func garbageCollectOrphanedPDBs(ctx context.Context, clientset kubernetes.Interf
 		}
 		workloadName := strings.TrimSuffix(strings.TrimPrefix(pdb.Name, "castai-"), "-pdb")
 
-		deploy, errDep := clientset.AppsV1().Deployments(pdb.Namespace).Get(ctx, workloadName, metav1.GetOptions{})
-		sts, errSts := clientset.AppsV1().StatefulSets(pdb.Namespace).Get(ctx, workloadName, metav1.GetOptions{})
+		deploy, errDep := getDeploymentForGC(ctx, clientset, rt, pdb.Namespace, workloadName)
+		sts, errSts := getStatefulSetForGC(ctx, clientset, rt, pdb.Namespace, workloadName)
 
 		var rollout *rolloutWorkload
 		var errRollout error
 		if rt.rolloutCRDKnown() {
-			rollout, errRollout = rt.getRollout(ctx, pdb.Namespace, workloadName)
+			rollout, errRollout = getRolloutForGC(ctx, rt, pdb.Namespace, workloadName)
 		} else {
 			errRollout = apierrors.NewNotFound(rt.getRolloutGVR().GroupResource(), workloadName)
 		}
@@ -1894,6 +1900,35 @@ func maxReplicasPtr(a, b *int32) *int32 {
 		return b
 	}
 	return a
+}
+
+// getDeploymentForGC prefers the synced Deploy lister; falls back to API when unset (tests).
+func getDeploymentForGC(ctx context.Context, clientset kubernetes.Interface, rt *controllerRuntime, namespace, name string) (*appsv1.Deployment, error) {
+	if rt != nil {
+		if l := rt.getDeployLister(); l != nil {
+			return l.Deployments(namespace).Get(name)
+		}
+	}
+	return clientset.AppsV1().Deployments(namespace).Get(ctx, name, metav1.GetOptions{})
+}
+
+// getStatefulSetForGC prefers the synced STS lister; falls back to API when unset (tests).
+func getStatefulSetForGC(ctx context.Context, clientset kubernetes.Interface, rt *controllerRuntime, namespace, name string) (*appsv1.StatefulSet, error) {
+	if rt != nil {
+		if l := rt.getSTSLister(); l != nil {
+			return l.StatefulSets(namespace).Get(name)
+		}
+	}
+	return clientset.AppsV1().StatefulSets(namespace).Get(ctx, name, metav1.GetOptions{})
+}
+
+// getRolloutForGC prefers a store hit (parsed); store miss/unavailable falls back to API
+// so GC does not treat a lagging cache as "Rollout absent".
+func getRolloutForGC(ctx context.Context, rt *controllerRuntime, namespace, name string) (*rolloutWorkload, error) {
+	if rw, ok := rt.getRolloutFromStore(namespace, name); ok {
+		return rw, nil
+	}
+	return rt.getRollout(ctx, namespace, name)
 }
 
 // Reconcile all workloads that use default PDB config

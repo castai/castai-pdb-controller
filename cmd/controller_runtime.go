@@ -112,6 +112,26 @@ func (rt *controllerRuntime) rolloutExistsInStore(namespace, name string) (exist
 	return exists, true
 }
 
+// getRolloutFromStore returns a parsed Rollout on a store hit. ok=false means miss,
+// unavailable store, or parse failure — callers should fall back to the API.
+func (rt *controllerRuntime) getRolloutFromStore(namespace, name string) (rw *rolloutWorkload, ok bool) {
+	rt.rolloutMu.RLock()
+	store := rt.rolloutStore
+	rt.rolloutMu.RUnlock()
+	if store == nil {
+		return nil, false
+	}
+	obj, exists, err := store.GetByKey(namespace + "/" + name)
+	if err != nil || !exists {
+		return nil, false
+	}
+	rw, err = rolloutFromInformerObj(obj)
+	if err != nil {
+		return nil, false
+	}
+	return rw, true
+}
+
 func (rt *controllerRuntime) rolloutInformerEnabled() bool {
 	rt.rolloutMu.RLock()
 	defer rt.rolloutMu.RUnlock()
