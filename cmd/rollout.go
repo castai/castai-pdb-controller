@@ -8,6 +8,7 @@ import (
 	"time"
 
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime"
@@ -66,12 +67,32 @@ func setRolloutSupport(client dynamic.Interface, enabled bool) {
 	rolloutKnown = true
 }
 
+// setRolloutCRDKnown records that the Rollouts API exists but leaves the informer off
+// (e.g. preflight list failed). GC and same-name checks can still use the client.
+func setRolloutCRDKnown(client dynamic.Interface) {
+	rolloutSupportMu.Lock()
+	defer rolloutSupportMu.Unlock()
+	rolloutClient = client
+	rolloutKnown = true
+	rolloutEnabled = false
+}
+
 // disableRolloutInformer keeps the CRD "known" for GC/collision lookups but stops
 // treating the informer as active (e.g. after a sync timeout).
 func disableRolloutInformer() {
 	rolloutSupportMu.Lock()
 	defer rolloutSupportMu.Unlock()
 	rolloutEnabled = false
+}
+
+// clearRolloutSupportIfAPIGone disables Rollout support when the API group/version
+// is gone (CRD uninstalled). Object-level NotFound must not clear support.
+func clearRolloutSupportIfAPIGone(err error) {
+	if err == nil || !meta.IsNoMatchError(err) {
+		return
+	}
+	logWarnf("Argo Rollouts API no longer available (%v); disabling Rollout PDB management", err)
+	setRolloutSupport(nil, false)
 }
 
 func rolloutInformerEnabled() bool {
@@ -260,9 +281,11 @@ func maybeStartRolloutInformer(ctx context.Context, clientset kubernetes.Interfa
 	listCtx, cancel := context.WithTimeout(ctx, rolloutListPreflightTO)
 	defer cancel()
 	if _, err := dynClient.Resource(gvr).Namespace(metav1.NamespaceAll).List(listCtx, metav1.ListOptions{Limit: 1}); err != nil {
-		logWarnf("Argo Rollouts API %s is present but listing Rollouts failed (%v); skipping Rollout PDB management so Deployment/StatefulSet management can proceed",
+		// CRD is installed but list failed (RBAC, timeout). Keep it known so GC/collision
+		// checks do not treat Rollouts as absent; leave the informer disabled.
+		setRolloutCRDKnown(dynClient)
+		logWarnf("Argo Rollouts API %s is present but listing Rollouts failed (%v); CRD marked known for GC/collision checks, informer disabled so Deployment/StatefulSet management can proceed",
 			gvr.String(), err)
-		setRolloutSupport(nil, false)
 		return nil, nil
 	}
 
@@ -324,6 +347,7 @@ func listRollouts(ctx context.Context, namespace string) ([]*rolloutWorkload, er
 	gvr := getRolloutGVR()
 	list, err := dyn.Resource(gvr).Namespace(namespace).List(ctx, metav1.ListOptions{})
 	if err != nil {
+		clearRolloutSupportIfAPIGone(err)
 		return nil, err
 	}
 	out := make([]*rolloutWorkload, 0, len(list.Items))
@@ -346,6 +370,7 @@ func getRollout(ctx context.Context, namespace, name string) (*rolloutWorkload, 
 	}
 	u, err := dyn.Resource(gvr).Namespace(namespace).Get(ctx, name, metav1.GetOptions{})
 	if err != nil {
+		clearRolloutSupportIfAPIGone(err)
 		return nil, err
 	}
 	return parseRolloutWorkload(u)

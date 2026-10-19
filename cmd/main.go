@@ -932,9 +932,11 @@ func runController(ctx context.Context, clientset *kubernetes.Clientset, restCon
 			rolloutSynced, stopRollouts = maybeStartRolloutInformer(ctx, clientset, dynClient)
 		}
 	}
-	if stopRollouts != nil {
-		defer stopRollouts()
-	}
+	defer func() {
+		if stopRollouts != nil {
+			stopRollouts()
+		}
+	}()
 
 	// Periodically scan for poor and multiple PDBs
 	go func() {
@@ -1050,7 +1052,6 @@ func runController(ctx context.Context, clientset *kubernetes.Clientset, restCon
 			logWarnf("Timed out waiting for Rollout informer sync; disabling Rollout handlers (CRD still known for GC/collision checks)")
 			if stopRollouts != nil {
 				stopRollouts()
-				stopRollouts = nil
 			}
 			disableRolloutInformer()
 		}
@@ -1660,14 +1661,15 @@ func deletePDBForWorkload(ctx context.Context, clientset kubernetes.Interface, o
 	}
 }
 
-// skipSameNameConflict logs and returns true when another managed kind shares namespace/name,
-// or when the conflict check cannot be completed. PDB names are castai-<name>-pdb (kind-agnostic).
+// skipSameNameConflict logs and returns true when another managed kind shares namespace/name.
+// Transient API errors are logged but do not skip create/update (only confirmed conflicts do).
+// PDB names are castai-<name>-pdb (kind-agnostic).
 func skipSameNameConflict(ctx context.Context, clientset kubernetes.Interface, namespace, name, selfKind string) bool {
 	others, err := sameNameConflicts(ctx, clientset, namespace, name, selfKind)
 	if err != nil {
-		logWarnf("Skipping PDB management for %s %s/%s: cannot confirm name uniqueness: %v",
+		logWarnf("Proceeding with PDB management for %s %s/%s despite name-conflict check error: %v",
 			selfKind, namespace, name, err)
-		return true
+		return false
 	}
 	if len(others) > 0 {
 		logWarnf("Skipping PDB management for %s %s/%s: same name also used by %v; rename one workload or manage its PDB manually",
@@ -1808,7 +1810,7 @@ func maxReplicasPtr(a, b *int32) *int32 {
 }
 
 // Reconcile all workloads that use default PDB config
-func reconcileAllDefaultPDBs(ctx context.Context, clientset *kubernetes.Clientset) {
+func reconcileAllDefaultPDBs(ctx context.Context, clientset kubernetes.Interface) {
 	logDebugf("reconcileAllDefaultPDBs called")
 	namespaces, err := clientset.CoreV1().Namespaces().List(ctx, metav1.ListOptions{})
 	if err != nil {
@@ -1975,7 +1977,7 @@ func hasBypassAnnotation(annotations map[string]string) bool {
 }
 
 // Audits all PodDisruptionBudgets and logs or fixes those with poor configuration for associated workloads.
-func scanAllPDBsForPoorConfig(ctx context.Context, clientset *kubernetes.Clientset) {
+func scanAllPDBsForPoorConfig(ctx context.Context, clientset kubernetes.Interface) {
 	pdbs, err := clientset.PolicyV1().PodDisruptionBudgets("").List(ctx, metav1.ListOptions{})
 	if err != nil {
 		logErrorf("Failed to list PDBs for audit: %v", err)

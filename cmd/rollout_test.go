@@ -17,7 +17,6 @@ import (
 	fakediscovery "k8s.io/client-go/discovery/fake"
 	dynamicfake "k8s.io/client-go/dynamic/fake"
 	"k8s.io/client-go/kubernetes/fake"
-	clienttesting "k8s.io/client-go/testing"
 )
 
 func newUnstructuredRollout(ns, name string, replicas int64, selector, podLabels map[string]string, ready, available int64) *unstructured.Unstructured {
@@ -251,28 +250,164 @@ func TestDiscoverRolloutGVR_missingGroup(t *testing.T) {
 }
 
 func TestDiscoverRolloutGVR_preferredVersion(t *testing.T) {
-	t.Parallel()
 	clientset := fake.NewSimpleClientset()
 	disco := clientset.Discovery().(*fakediscovery.FakeDiscovery)
 	disco.Resources = []*metav1.APIResourceList{
 		{
 			GroupVersion: "argoproj.io/v1alpha1",
-			APIResources: []metav1.APIResource{{Name: "rollouts", Kind: "Rollout", Namespaced: true}},
+			APIResources: []metav1.APIResource{{Name: "rollouts", Kind: "Rollout", Namespaced: true, Verbs: []string{"get", "list", "watch"}}},
 		},
 	}
-	// ServerGroups is derived from Resources in fake discovery when using Invokes;
-	// ensure group listing works via reactor.
-	disco.AddReactor("get", "group", func(action clienttesting.Action) (bool, runtime.Object, error) {
-		return false, nil, nil
-	})
-
-	// Fake discovery ServerGroups reads from Resources in newer client-go; set explicitly if needed.
 	gvr, available, err := discoverRolloutGVR(disco)
 	if err != nil {
 		t.Fatal(err)
 	}
-	// Some fake discovery setups omit groups unless configured; accept either unavailable or preferred GVR.
-	if available && (gvr.Group != rolloutGroup || gvr.Resource != rolloutResource) {
+	if !available {
+		t.Fatal("expected Rollouts available at preferred version")
+	}
+	if gvr.Group != rolloutGroup || gvr.Version != rolloutVersionPreferred || gvr.Resource != rolloutResource {
 		t.Fatalf("unexpected gvr: %#v", gvr)
+	}
+}
+
+func TestDiscoverRolloutGVR_fallbackVersion(t *testing.T) {
+	clientset := fake.NewSimpleClientset()
+	disco := clientset.Discovery().(*fakediscovery.FakeDiscovery)
+	// Preferred v1alpha1 missing; older/other version still serves rollouts.
+	disco.Resources = []*metav1.APIResourceList{
+		{
+			GroupVersion: "argoproj.io/v1alpha1",
+			APIResources: []metav1.APIResource{{Name: "analyses", Kind: "AnalysisRun", Namespaced: true}},
+		},
+		{
+			GroupVersion: "argoproj.io/v1beta1",
+			APIResources: []metav1.APIResource{{Name: "rollouts", Kind: "Rollout", Namespaced: true, Verbs: []string{"get", "list", "watch"}}},
+		},
+	}
+	gvr, available, err := discoverRolloutGVR(disco)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !available {
+		t.Fatal("expected fallback discovery to find rollouts")
+	}
+	if gvr.Group != rolloutGroup || gvr.Resource != rolloutResource || gvr.Version != "v1beta1" {
+		t.Fatalf("expected v1beta1 fallback, got %#v", gvr)
+	}
+}
+
+func TestCreatePDBForWorkload_rolloutHonorsMinAvailableAnnotation(t *testing.T) {
+	resetDefaultPDBConfig()
+	t.Cleanup(resetDefaultPDBConfig)
+
+	two := int32(2)
+	rw := &rolloutWorkload{
+		Namespace: "default", Name: "anno-ro", Replicas: &two,
+		Selector:          &metav1.LabelSelector{MatchLabels: map[string]string{"app": "anno-ro"}},
+		PodTemplateLabels: map[string]string{"app": "anno-ro"},
+		Annotations:       map[string]string{annotationMinAvailable: "2"},
+		ReadyReplicas:     2, AvailableReplicas: 2,
+	}
+	clientset := fake.NewSimpleClientset()
+	createPDBForWorkload(context.Background(), clientset, rw)
+	got, err := clientset.PolicyV1().PodDisruptionBudgets("default").Get(context.Background(), "castai-anno-ro-pdb", metav1.GetOptions{})
+	if err != nil {
+		t.Fatalf("expected PDB: %v", err)
+	}
+	if got.Spec.MinAvailable == nil || got.Spec.MinAvailable.IntVal != 2 {
+		t.Fatalf("expected minAvailable=2 from annotation, got %#v", got.Spec.MinAvailable)
+	}
+}
+
+func TestDeletePDBForWorkload_keepsPDBWhenSameNamedRolloutExists(t *testing.T) {
+	resetDefaultPDBConfig()
+	t.Cleanup(resetDefaultPDBConfig)
+	t.Cleanup(func() { setRolloutSupport(nil, false) })
+
+	pdb := &policyv1.PodDisruptionBudget{
+		ObjectMeta: metav1.ObjectMeta{Name: "castai-shared-pdb", Namespace: "default"},
+		Spec:       policyv1.PodDisruptionBudgetSpec{Selector: &metav1.LabelSelector{MatchLabels: map[string]string{"app": "ro"}}},
+	}
+	dep := &appsv1.Deployment{ObjectMeta: metav1.ObjectMeta{Name: "shared", Namespace: "default"}}
+	clientset := fake.NewSimpleClientset(pdb, dep)
+	u := newUnstructuredRollout("default", "shared", 2,
+		map[string]string{"app": "ro"},
+		map[string]string{"app": "ro"},
+		2, 2,
+	)
+	dyn := dynamicfake.NewSimpleDynamicClientWithCustomListKinds(
+		runtime.NewScheme(),
+		map[schema.GroupVersionResource]string{getRolloutGVR(): "RolloutList"},
+		u,
+	)
+	setRolloutSupport(dyn, true)
+
+	deletePDBForWorkload(context.Background(), clientset, dep)
+	if _, err := clientset.PolicyV1().PodDisruptionBudgets("default").Get(context.Background(), "castai-shared-pdb", metav1.GetOptions{}); err != nil {
+		t.Fatalf("PDB must remain when same-named Rollout still exists: %v", err)
+	}
+}
+
+func TestHandleWorkloadUpdate_rolloutAnnotationUpdatesPDB(t *testing.T) {
+	resetDefaultPDBConfig()
+	t.Cleanup(resetDefaultPDBConfig)
+
+	two := int32(2)
+	existing := &policyv1.PodDisruptionBudget{
+		ObjectMeta: metav1.ObjectMeta{Name: "castai-canary-api-pdb", Namespace: "default"},
+		Spec: policyv1.PodDisruptionBudgetSpec{
+			Selector:     &metav1.LabelSelector{MatchLabels: map[string]string{"app": "canary-api"}},
+			MinAvailable: &intstr.IntOrString{Type: intstr.Int, IntVal: 1},
+		},
+	}
+	clientset := fake.NewSimpleClientset(existing)
+	oldRW := &rolloutWorkload{
+		Namespace: "default", Name: "canary-api", Replicas: &two,
+		Selector:          &metav1.LabelSelector{MatchLabels: map[string]string{"app": "canary-api"}},
+		PodTemplateLabels: map[string]string{"app": "canary-api"},
+		ReadyReplicas:     2, AvailableReplicas: 2,
+	}
+	newRW := &rolloutWorkload{
+		Namespace: "default", Name: "canary-api", Replicas: &two,
+		Selector:          &metav1.LabelSelector{MatchLabels: map[string]string{"app": "canary-api"}},
+		PodTemplateLabels: map[string]string{"app": "canary-api"},
+		Annotations:       map[string]string{annotationMinAvailable: "2"},
+		ReadyReplicas:     2, AvailableReplicas: 2,
+	}
+	handleWorkloadUpdate(context.Background(), clientset, oldRW, newRW)
+	got, err := clientset.PolicyV1().PodDisruptionBudgets("default").Get(context.Background(), "castai-canary-api-pdb", metav1.GetOptions{})
+	if err != nil {
+		t.Fatalf("get PDB: %v", err)
+	}
+	if got.Spec.MinAvailable == nil || got.Spec.MinAvailable.IntVal != 2 {
+		t.Fatalf("expected updated minAvailable=2, got %#v", got.Spec.MinAvailable)
+	}
+}
+
+func TestWorkloadReplicaHealth_rollout(t *testing.T) {
+	t.Parallel()
+	two := int32(2)
+	rw := &rolloutWorkload{Replicas: &two, ReadyReplicas: 2, AvailableReplicas: 2}
+	desired, ready, available, ok := workloadReplicaHealth(rw)
+	if !ok || desired != 2 || ready != 2 || available != 2 {
+		t.Fatalf("got desired=%d ready=%d available=%d ok=%v", desired, ready, available, ok)
+	}
+}
+
+func TestSetRolloutCRDKnown_keepsKnownWithoutInformer(t *testing.T) {
+	t.Cleanup(func() { setRolloutSupport(nil, false) })
+	dyn := dynamicfake.NewSimpleDynamicClientWithCustomListKinds(
+		runtime.NewScheme(),
+		map[schema.GroupVersionResource]string{getRolloutGVR(): "RolloutList"},
+	)
+	setRolloutCRDKnown(dyn)
+	if !rolloutCRDKnown() {
+		t.Fatal("expected CRD known")
+	}
+	if rolloutInformerEnabled() {
+		t.Fatal("informer must stay disabled")
+	}
+	if _, ok := getRolloutClient(); !ok {
+		t.Fatal("lookup client should remain available")
 	}
 }
