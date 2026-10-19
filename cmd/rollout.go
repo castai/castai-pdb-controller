@@ -173,9 +173,6 @@ func rolloutFromInformerObj(obj interface{}) (*rolloutWorkload, error) {
 	return parseRolloutWorkload(u)
 }
 
-// maybeStartRolloutInformer enables Rollout watches when the CRD is present and listable.
-// On sync failure the caller should stop the returned cancel and call disableRolloutInformer
-// so GC does not treat Rollouts as absent while the CRD remains installed.
 func (rt *controllerRuntime) clearRolloutSupportIfAPIGone(err error) {
 	if err == nil || !meta.IsNoMatchError(err) {
 		return
@@ -184,6 +181,9 @@ func (rt *controllerRuntime) clearRolloutSupportIfAPIGone(err error) {
 	rt.setRolloutSupport(nil, false)
 }
 
+// maybeStartRolloutInformer enables Rollout watches when the CRD is present and listable.
+// On sync failure the caller should stop the returned cancel and call disableRolloutInformer
+// so GC does not treat Rollouts as absent while the CRD remains installed.
 func (rt *controllerRuntime) maybeStartRolloutInformer(ctx context.Context, clientset kubernetes.Interface, dynClient dynamic.Interface) (cache.InformerSynced, context.CancelFunc) {
 	gvr, available, err := discoverRolloutGVR(clientset.Discovery())
 	if err != nil {
@@ -262,16 +262,17 @@ func (rt *controllerRuntime) maybeStartRolloutInformer(ctx context.Context, clie
 	return informer.HasSynced, stopRollouts
 }
 
-// retryRolloutInformerPeriodically restarts the Rollout informer when the CRD is known
-// but the informer was disabled (sync timeout / preflight failure). Tries immediately,
-// then backs off on rolloutInformerRetryInterval until enabled or ctx is cancelled.
+// retryRolloutInformerPeriodically keeps trying to enable the Rollout informer until
+// it is active or ctx is cancelled. Covers: CRD installed after controller start,
+// preflight list failure, and initial sync timeout. Tries immediately, then every
+// rolloutInformerRetryInterval.
 func (rt *controllerRuntime) retryRolloutInformerPeriodically(ctx context.Context, clientset kubernetes.Interface, restConfig *rest.Config, setStop func(context.CancelFunc)) {
 	if restConfig == nil {
 		return
 	}
 	attempt := func() bool {
-		if rt.rolloutInformerEnabled() || !rt.rolloutCRDKnown() {
-			return rt.rolloutInformerEnabled()
+		if rt.rolloutInformerEnabled() {
+			return true
 		}
 		dynClient, err := dynamic.NewForConfig(restConfig)
 		if err != nil {
@@ -283,6 +284,7 @@ func (rt *controllerRuntime) retryRolloutInformerPeriodically(ctx context.Contex
 			if stop != nil {
 				stop()
 			}
+			// CRD still absent, or present but not listable — try again later.
 			return false
 		}
 		syncCtx, cancel := context.WithTimeout(ctx, 30*time.Second)

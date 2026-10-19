@@ -1780,10 +1780,12 @@ func statefulSetExistsForConflict(ctx context.Context, clientset kubernetes.Inte
 }
 
 func rolloutExistsForConflict(ctx context.Context, rt *controllerRuntime, namespace, name string) (bool, error) {
-	if exists, ok := rt.rolloutExistsInStore(namespace, name); ok {
-		return exists, nil
+	// Trust store hits only. A miss (or unavailable store) must hit the API:
+	// Deploy/STS handlers can run before the Rollout informer has finished its
+	// initial sync, so an empty store is not proof the Rollout is absent.
+	if exists, ok := rt.rolloutExistsInStore(namespace, name); ok && exists {
+		return true, nil
 	}
-	// Informer store unavailable (disabled/sync failed) — bounded API fallback.
 	_, err := rt.getRollout(ctx, namespace, name)
 	if err == nil {
 		return true, nil

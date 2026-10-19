@@ -10,6 +10,7 @@ import (
 	corev1 "k8s.io/api/core/v1"
 	policyv1 "k8s.io/api/policy/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime"
@@ -497,5 +498,124 @@ func TestRolloutExistsInStore_errorFallsBack(t *testing.T) {
 	exists, ok := rt.rolloutExistsInStore("default", "shared")
 	if ok || exists {
 		t.Fatalf("GetByKey error must force API fallback (ok=false), got ok=%v exists=%v", ok, exists)
+	}
+}
+
+func TestRolloutExistsForConflict_storeMissFallsBackToAPI(t *testing.T) {
+	rt := newControllerRuntime()
+	t.Cleanup(func() { rt.setRolloutSupport(nil, false) })
+
+	u := newUnstructuredRollout("default", "shared", 2,
+		map[string]string{"app": "shared"},
+		map[string]string{"app": "shared"},
+		2, 2,
+	)
+	dyn := dynamicfake.NewSimpleDynamicClientWithCustomListKinds(
+		runtime.NewScheme(),
+		map[schema.GroupVersionResource]string{rt.getRolloutGVR(): "RolloutList"},
+		u,
+	)
+	rt.setRolloutSupport(dyn, true)
+	// Empty store mimics Deploy/STS handlers racing ahead of Rollout cache sync.
+	rt.setRolloutStore(cache.NewStore(cache.MetaNamespaceKeyFunc))
+
+	exists, err := rolloutExistsForConflict(context.Background(), rt, "default", "shared")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if !exists {
+		t.Fatal("store miss must fall back to API and observe the Rollout")
+	}
+}
+
+func TestRolloutExistsForConflict_storeHitSkipsAPI(t *testing.T) {
+	rt := newControllerRuntime()
+	t.Cleanup(func() { rt.setRolloutSupport(nil, false) })
+
+	store := cache.NewStore(cache.MetaNamespaceKeyFunc)
+	u := newUnstructuredRollout("default", "shared", 2,
+		map[string]string{"app": "shared"},
+		map[string]string{"app": "shared"},
+		2, 2,
+	)
+	if err := store.Add(u); err != nil {
+		t.Fatal(err)
+	}
+	// No dynamic client — if we incorrectly fall through to API on a hit, Get fails.
+	rt.setRolloutCRDKnown(nil)
+	rt.setRolloutStore(store)
+
+	exists, err := rolloutExistsForConflict(context.Background(), rt, "default", "shared")
+	if err != nil {
+		t.Fatalf("store hit should not need API: %v", err)
+	}
+	if !exists {
+		t.Fatal("expected store hit to report Rollout present")
+	}
+}
+
+func TestClearRolloutSupportIfAPIGone(t *testing.T) {
+	rt := newControllerRuntime()
+	t.Cleanup(func() { rt.setRolloutSupport(nil, false) })
+
+	dyn := dynamicfake.NewSimpleDynamicClientWithCustomListKinds(
+		runtime.NewScheme(),
+		map[schema.GroupVersionResource]string{rt.getRolloutGVR(): "RolloutList"},
+	)
+	rt.setRolloutSupport(dyn, true)
+	rt.clearRolloutSupportIfAPIGone(fmt.Errorf("some other error"))
+	if !rt.rolloutCRDKnown() || !rt.rolloutInformerEnabled() {
+		t.Fatal("non-NoMatch errors must leave Rollout support enabled")
+	}
+
+	rt.clearRolloutSupportIfAPIGone(&meta.NoKindMatchError{
+		GroupKind: schema.GroupKind{Group: rolloutGroup, Kind: "Rollout"},
+	})
+	if rt.rolloutCRDKnown() || rt.rolloutInformerEnabled() {
+		t.Fatal("NoMatchError must disable Rollout support")
+	}
+}
+
+func TestMaybeStartRolloutInformer_absentCRDLeavesUnknown(t *testing.T) {
+	rt := newControllerRuntime()
+	t.Cleanup(func() { rt.setRolloutSupport(nil, false) })
+
+	clientset := fake.NewSimpleClientset()
+	disco := clientset.Discovery().(*fakediscovery.FakeDiscovery)
+	disco.Resources = []*metav1.APIResourceList{}
+	dyn := dynamicfake.NewSimpleDynamicClientWithCustomListKinds(
+		runtime.NewScheme(),
+		map[schema.GroupVersionResource]string{rt.getRolloutGVR(): "RolloutList"},
+	)
+
+	synced, stop := rt.maybeStartRolloutInformer(context.Background(), clientset, dyn)
+	if synced != nil || stop != nil {
+		t.Fatal("expected no informer when CRD absent")
+	}
+	if rt.rolloutCRDKnown() || rt.rolloutInformerEnabled() {
+		t.Fatal("absent CRD must leave Rollout support unknown/disabled for later rediscovery")
+	}
+}
+
+func TestDisableRolloutInformer_keepsCRDKnownClearsStore(t *testing.T) {
+	rt := newControllerRuntime()
+	t.Cleanup(func() { rt.setRolloutSupport(nil, false) })
+
+	dyn := dynamicfake.NewSimpleDynamicClientWithCustomListKinds(
+		runtime.NewScheme(),
+		map[schema.GroupVersionResource]string{rt.getRolloutGVR(): "RolloutList"},
+	)
+	rt.setRolloutSupport(dyn, true)
+	rt.setRolloutStore(cache.NewStore(cache.MetaNamespaceKeyFunc))
+	rt.disableRolloutInformer()
+
+	if !rt.rolloutCRDKnown() {
+		t.Fatal("sync-timeout path must keep CRD known for GC/conflict API fallback")
+	}
+	if rt.rolloutInformerEnabled() {
+		t.Fatal("informer must be disabled after sync timeout")
+	}
+	if _, ok := rt.rolloutExistsInStore("default", "x"); ok {
+		t.Fatal("store must be cleared so conflict checks use API")
 	}
 }

@@ -10,7 +10,7 @@ This controller enables safe, automated disruption management with per-workload 
 - **Automatic PDB Creation/Update:**  
   Ensures every eligible Deployment/StatefulSet/Rollout has a PDB, using defaults or per-workload overrides.
 
-  **Rollout notes:** Only Rollouts with an inline `spec.selector` are supported (`workloadRef`-based Rollouts are skipped with a warning). PDB names remain `castai-<name>-pdb`. If a Deployment, StatefulSet, and/or Rollout share the same name in a namespace, the controller logs a warning and skips PDB management for those workloads.
+  **Rollout notes:** Only Rollouts with an inline `spec.selector` are supported (`workloadRef`-based Rollouts are skipped with a warning). PDB names remain `castai-<name>-pdb`. If a Deployment, StatefulSet, and/or Rollout share the same name in a namespace, the controller logs a warning and skips PDB management for those workloads. If the Argo Rollouts CRD is installed after the controller is already running, Rollout support is picked up on the background retry interval (no restart required).
 
 - **Annotation-Based Customization:**  
   Users can set `minAvailable`, `maxUnavailable`, or opt out of PDB management with annotations.

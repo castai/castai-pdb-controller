@@ -95,8 +95,9 @@ func (rt *controllerRuntime) setRolloutStore(store cache.Store) {
 	rt.rolloutStore = store
 }
 
-// rolloutExistsInStore reports (exists, storeAvailable). When storeAvailable is false,
-// callers should fall back to a direct API get (including on GetByKey errors).
+// rolloutExistsInStore reports (exists, storeAvailable). Callers may trust a positive
+// hit. A miss or storeAvailable=false must fall back to the API — the store can lag
+// Deploy/STS handlers during initial Rollout informer sync (including GetByKey errors).
 func (rt *controllerRuntime) rolloutExistsInStore(namespace, name string) (exists bool, storeAvailable bool) {
 	rt.rolloutMu.RLock()
 	store := rt.rolloutStore
