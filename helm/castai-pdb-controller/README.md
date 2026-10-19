@@ -4,9 +4,9 @@ A Helm chart for deploying the CAST AI Pod Disruption Budget (PDB) Controller to
 
 ## Overview
 
-The CAST AI PDB Controller automatically creates, updates, and manages PodDisruptionBudgets for Deployments and StatefulSets in your Kubernetes cluster. It ensures high availability during cluster maintenance and node disruptions by:
+The CAST AI PDB Controller automatically creates, updates, and manages PodDisruptionBudgets for Deployments, StatefulSets, and Argo Rollouts (when the CRD is installed) in your Kubernetes cluster. It ensures high availability during cluster maintenance and node disruptions by:
 
-- Automatically creating PDBs for Deployments and StatefulSets
+- Automatically creating PDBs for Deployments, StatefulSets, and Rollouts
 - Monitoring and fixing poor PDB configurations
 - Supporting annotation-driven PDB customization
 - Providing regex-based exclusion rules for selective PDB management
