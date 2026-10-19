@@ -473,7 +473,8 @@ func updateExistingPDB(ctx context.Context, clientset kubernetes.Interface, exis
 
 	pdbSpec.UnhealthyPodEvictionPolicy = resolveUnhealthyPodEvictionPolicy(workloadAnnotations)
 
-	// Enrich selector with additional labels (same as in createPDBForWorkload)
+	// Enrich selector with additional labels (same as in createPDBForWorkload).
+	// asWorkloadView covers Deployment, StatefulSet, and Rollout — no type switch needed.
 	var podTemplateLabels map[string]string
 	if wv, ok := asWorkloadView(obj); ok {
 		podTemplateLabels = wv.podTemplateLabels
@@ -1078,20 +1079,27 @@ func runController(ctx context.Context, clientset *kubernetes.Clientset, restCon
 	}()
 
 	factory.Start(ctx.Done())
-	toSync := []cache.InformerSynced{deployInformer.HasSynced, stsInformer.HasSynced}
-	if rolloutSynced != nil {
-		toSync = append(toSync, rolloutSynced)
-	}
-	for _, synced := range toSync {
+	// Always sync Deployment/StatefulSet informers first. Rollout sync is best-effort with a
+	// timeout so a stuck Rollout watch (RBAC, API issues) cannot block core PDB management.
+	for _, synced := range []cache.InformerSynced{deployInformer.HasSynced, stsInformer.HasSynced} {
 		if !cache.WaitForCacheSync(ctx.Done(), synced) {
 			panic("failed to sync informer cache")
+		}
+	}
+	if rolloutSynced != nil {
+		syncCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
+		ok := cache.WaitForCacheSync(syncCtx.Done(), rolloutSynced)
+		cancel()
+		if !ok {
+			logWarnf("Timed out waiting for Rollout informer sync; disabling Rollout PDB management so Deployment/StatefulSet management continues")
+			setRolloutSupport(nil, false)
 		}
 	}
 	<-ctx.Done()
 }
 
 // watches for changes to the custom annotations (min, max, and bypass)
-func handleWorkloadUpdate(ctx context.Context, clientset *kubernetes.Clientset, oldObj, newObj interface{}) {
+func handleWorkloadUpdate(ctx context.Context, clientset kubernetes.Interface, oldObj, newObj interface{}) {
 	oldWV, oldOK := asWorkloadView(oldObj)
 	newWV, newOK := asWorkloadView(newObj)
 	if !oldOK || !newOK {
@@ -1566,7 +1574,7 @@ func createPDBForWorkload(ctx context.Context, clientset kubernetes.Interface, o
 }
 
 // Deletes the PodDisruptionBudget associated with a given Deployment, StatefulSet, or Rollout workload.
-func deletePDBForWorkload(ctx context.Context, clientset *kubernetes.Clientset, obj interface{}) {
+func deletePDBForWorkload(ctx context.Context, clientset kubernetes.Interface, obj interface{}) {
 	wv, ok := asWorkloadView(obj)
 	if !ok {
 		logWarnf("deletePDBForWorkload: unsupported workload type %T", obj)
@@ -1615,7 +1623,7 @@ func garbageCollectOrphanedPDBs(ctx context.Context, clientset kubernetes.Interf
 		if _, rolloutsOn := getRolloutSupport(); rolloutsOn {
 			rollout, errRollout = getRollout(ctx, pdb.Namespace, workloadName)
 		} else {
-			errRollout = apierrors.NewNotFound(rolloutGVR.GroupResource(), workloadName)
+			errRollout = apierrors.NewNotFound(getRolloutGVR().GroupResource(), workloadName)
 		}
 
 		// Transient API errors (timeout, RBAC, etc.) must not be treated as
@@ -1649,14 +1657,33 @@ func garbageCollectOrphanedPDBs(ctx context.Context, clientset kubernetes.Interf
 
 		// Workload still exists: check whether it has fewer than 2 replicas. If so, the PDB
 		// should not exist (see deleteCastaiPDBIfUnderReplicated) regardless of how it got here.
-		var replicas *int32
+		// When a Deployment/StatefulSet/Rollout share a name, pick the owner by PDB selector match.
+		candidates := make([]gcWorkloadCandidate, 0, 3)
 		if errDep == nil {
-			replicas = deploy.Spec.Replicas
-		} else if errSts == nil {
-			replicas = sts.Spec.Replicas
-		} else if rollout != nil {
-			replicas = rollout.Replicas
+			candidates = append(candidates, gcWorkloadCandidate{
+				kind:              "Deployment",
+				replicas:          deploy.Spec.Replicas,
+				selector:          deploy.Spec.Selector,
+				podTemplateLabels: deploy.Spec.Template.Labels,
+			})
 		}
+		if errSts == nil {
+			candidates = append(candidates, gcWorkloadCandidate{
+				kind:              "StatefulSet",
+				replicas:          sts.Spec.Replicas,
+				selector:          sts.Spec.Selector,
+				podTemplateLabels: sts.Spec.Template.Labels,
+			})
+		}
+		if rollout != nil {
+			candidates = append(candidates, gcWorkloadCandidate{
+				kind:              "Rollout",
+				replicas:          rollout.Replicas,
+				selector:          rollout.Selector,
+				podTemplateLabels: rollout.PodTemplateLabels,
+			})
+		}
+		replicas := pickGCWorkloadReplicas(&pdb, workloadName, candidates)
 		if replicas == nil || *replicas < 2 {
 			err := clientset.PolicyV1().PodDisruptionBudgets(pdb.Namespace).Delete(ctx, pdb.Name, metav1.DeleteOptions{})
 			if err != nil {
@@ -1672,8 +1699,62 @@ func garbageCollectOrphanedPDBs(ctx context.Context, clientset kubernetes.Interf
 	}
 }
 
+// gcWorkloadCandidate is a same-named workload considered while GC'ing a castai PDB.
+type gcWorkloadCandidate struct {
+	kind              string
+	replicas          *int32
+	selector          *metav1.LabelSelector
+	podTemplateLabels map[string]string
+}
+
+// pickGCWorkloadReplicas chooses which same-named workload's replica count to use for
+// under-replication GC. Prefer an exact selector match or PDB coverage of pod template labels.
+func pickGCWorkloadReplicas(pdb *policyv1.PodDisruptionBudget, workloadName string, candidates []gcWorkloadCandidate) *int32 {
+	if len(candidates) == 0 {
+		return nil
+	}
+	if len(candidates) == 1 {
+		return candidates[0].replicas
+	}
+
+	matched := make([]gcWorkloadCandidate, 0, len(candidates))
+	for _, c := range candidates {
+		if pdb.Spec.Selector != nil && c.selector != nil {
+			pdbSel, err1 := metav1.LabelSelectorAsSelector(pdb.Spec.Selector)
+			wSel, err2 := metav1.LabelSelectorAsSelector(c.selector)
+			if err1 == nil && err2 == nil && pdbSel.String() == wSel.String() {
+				matched = append(matched, c)
+				continue
+			}
+		}
+		if covers, _ := pdbCoversPodTemplate(pdb, c.podTemplateLabels); covers {
+			matched = append(matched, c)
+		}
+	}
+	if len(matched) == 1 {
+		return matched[0].replicas
+	}
+	if len(matched) > 1 {
+		kinds := make([]string, 0, len(matched))
+		for _, c := range matched {
+			kinds = append(kinds, c.kind)
+		}
+		logWarnf("PDB %s/%s matches multiple workloads named %q (%v); using %s replicas for under-replication GC",
+			pdb.Namespace, pdb.Name, workloadName, kinds, matched[0].kind)
+		return matched[0].replicas
+	}
+
+	kinds := make([]string, 0, len(candidates))
+	for _, c := range candidates {
+		kinds = append(kinds, c.kind)
+	}
+	logWarnf("PDB %s/%s: multiple workloads named %q exist (%v) without a clear selector match; using %s replicas",
+		pdb.Namespace, pdb.Name, workloadName, kinds, candidates[0].kind)
+	return candidates[0].replicas
+}
+
 // Reconcile all workloads that use default PDB config
-func reconcileAllDefaultPDBs(ctx context.Context, clientset *kubernetes.Clientset) {
+func reconcileAllDefaultPDBs(ctx context.Context, clientset kubernetes.Interface) {
 	logDebugf("reconcileAllDefaultPDBs called")
 	namespaces, err := clientset.CoreV1().Namespaces().List(ctx, metav1.ListOptions{})
 	if err != nil {
@@ -1821,7 +1902,7 @@ func hasBypassAnnotation(annotations map[string]string) bool {
 }
 
 // Audits all PodDisruptionBudgets and logs or fixes those with poor configuration for associated workloads.
-func scanAllPDBsForPoorConfig(ctx context.Context, clientset *kubernetes.Clientset) {
+func scanAllPDBsForPoorConfig(ctx context.Context, clientset kubernetes.Interface) {
 	pdbs, err := clientset.PolicyV1().PodDisruptionBudgets("").List(ctx, metav1.ListOptions{})
 	if err != nil {
 		logErrorf("Failed to list PDBs for audit: %v", err)

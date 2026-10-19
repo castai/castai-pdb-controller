@@ -19,16 +19,11 @@ import (
 )
 
 const (
-	rolloutGroup    = "argoproj.io"
-	rolloutVersion  = "v1alpha1"
-	rolloutResource = "rollouts"
+	rolloutGroup            = "argoproj.io"
+	rolloutVersionPreferred = "v1alpha1"
+	rolloutResource         = "rollouts"
+	rolloutListPreflightTO  = 10 * time.Second
 )
-
-var rolloutGVR = schema.GroupVersionResource{
-	Group:    rolloutGroup,
-	Version:  rolloutVersion,
-	Resource: rolloutResource,
-}
 
 // rolloutWorkload is a typed view of an Argo Rollout for PDB management.
 // Parsed from unstructured so we do not take a hard dependency on the Rollouts SDK.
@@ -48,6 +43,11 @@ var (
 	rolloutSupportMu        sync.RWMutex
 	rolloutSupportAvailable bool
 	rolloutDynamicClient    dynamic.Interface
+	activeRolloutGVR        = schema.GroupVersionResource{
+		Group:    rolloutGroup,
+		Version:  rolloutVersionPreferred,
+		Resource: rolloutResource,
+	}
 )
 
 func setRolloutSupport(client dynamic.Interface, available bool) {
@@ -63,27 +63,68 @@ func getRolloutSupport() (dynamic.Interface, bool) {
 	return rolloutDynamicClient, rolloutSupportAvailable
 }
 
-// rolloutsCRDAvailable reports whether the Argo Rollouts API is present on the cluster.
-// Missing CRD is not an error — callers should skip Rollout management and log.
-func rolloutsCRDAvailable(discoveryClient discovery.DiscoveryInterface) (bool, error) {
-	gv := rolloutGroup + "/" + rolloutVersion
-	list, err := discoveryClient.ServerResourcesForGroupVersion(gv)
-	if err != nil {
-		if apierrors.IsNotFound(err) {
-			return false, nil
-		}
-		// Aggregated discovery can report partial group failures when the API is absent.
-		if discovery.IsGroupDiscoveryFailedError(err) {
-			return false, nil
-		}
-		return false, err
+func getRolloutGVR() schema.GroupVersionResource {
+	rolloutSupportMu.RLock()
+	defer rolloutSupportMu.RUnlock()
+	return activeRolloutGVR
+}
+
+func setRolloutGVR(gvr schema.GroupVersionResource) {
+	rolloutSupportMu.Lock()
+	defer rolloutSupportMu.Unlock()
+	activeRolloutGVR = gvr
+}
+
+// discoverRolloutGVR finds a usable Rollouts GVR via discovery.
+// Prefers argoproj.io/v1alpha1 (current Argo Rollouts), otherwise any argoproj.io version that serves rollouts.
+func discoverRolloutGVR(discoveryClient discovery.DiscoveryInterface) (schema.GroupVersionResource, bool, error) {
+	preferred := schema.GroupVersionResource{
+		Group:    rolloutGroup,
+		Version:  rolloutVersionPreferred,
+		Resource: rolloutResource,
 	}
-	for _, r := range list.APIResources {
-		if r.Name == rolloutResource {
-			return true, nil
+	if list, err := discoveryClient.ServerResourcesForGroupVersion(preferred.GroupVersion().String()); err == nil {
+		for _, r := range list.APIResources {
+			if r.Name == rolloutResource {
+				return preferred, true, nil
+			}
+		}
+	} else if err != nil && !apierrors.IsNotFound(err) && !discovery.IsGroupDiscoveryFailedError(err) {
+		// Fall through to a full scan; only hard-fail if that also fails.
+		logDebugf("Preferred Rollout GV %s lookup failed: %v; scanning discovery", preferred.GroupVersion().String(), err)
+	}
+
+	_, resourceLists, err := discoveryClient.ServerGroupsAndResources()
+	if err != nil && len(resourceLists) == 0 {
+		if apierrors.IsNotFound(err) || discovery.IsGroupDiscoveryFailedError(err) {
+			return schema.GroupVersionResource{}, false, nil
+		}
+		return schema.GroupVersionResource{}, false, err
+	}
+
+	var fallback schema.GroupVersionResource
+	for _, rl := range resourceLists {
+		gv, parseErr := schema.ParseGroupVersion(rl.GroupVersion)
+		if parseErr != nil || gv.Group != rolloutGroup {
+			continue
+		}
+		for _, r := range rl.APIResources {
+			if r.Name != rolloutResource {
+				continue
+			}
+			candidate := schema.GroupVersionResource{Group: gv.Group, Version: gv.Version, Resource: r.Name}
+			if gv.Version == rolloutVersionPreferred {
+				return candidate, true, nil
+			}
+			if fallback.Resource == "" {
+				fallback = candidate
+			}
 		}
 	}
-	return false, nil
+	if fallback.Resource != "" {
+		return fallback, true, nil
+	}
+	return schema.GroupVersionResource{}, false, nil
 }
 
 func parseRolloutWorkload(u *unstructured.Unstructured) (*rolloutWorkload, error) {
@@ -149,29 +190,42 @@ func rolloutFromInformerObj(obj interface{}) (*rolloutWorkload, error) {
 	return parseRolloutWorkload(u)
 }
 
-// maybeStartRolloutInformer checks for the Rollouts CRD and, when present, watches Rollouts
+// maybeStartRolloutInformer checks for the Rollouts API and, when usable, watches Rollouts
 // with the same PDB create/update/delete handlers used for Deployments/StatefulSets.
 // Returns the informer's HasSynced func when started, or nil when Rollouts are unavailable.
+// A failed list preflight (e.g. missing RBAC) disables Rollouts instead of blocking startup.
 func maybeStartRolloutInformer(ctx context.Context, clientset *kubernetes.Clientset, dynClient dynamic.Interface) cache.InformerSynced {
-	available, err := rolloutsCRDAvailable(clientset.Discovery())
+	gvr, available, err := discoverRolloutGVR(clientset.Discovery())
 	if err != nil {
-		logWarnf("Failed to check for Argo Rollouts CRD (%s/%s, resource=%s): %v; skipping Rollout PDB management",
-			rolloutGroup, rolloutVersion, rolloutResource, err)
+		logWarnf("Failed to discover Argo Rollouts API (%s, resource=%s): %v; skipping Rollout PDB management",
+			rolloutGroup, rolloutResource, err)
 		setRolloutSupport(nil, false)
 		return nil
 	}
 	if !available {
-		logInfof("Argo Rollouts CRD (%s/%s, resource=%s) not found; skipping Rollout PDB management",
-			rolloutGroup, rolloutVersion, rolloutResource)
+		logInfof("Argo Rollouts API (%s, resource=%s) not found; skipping Rollout PDB management",
+			rolloutGroup, rolloutResource)
+		setRolloutSupport(nil, false)
+		return nil
+	}
+	setRolloutGVR(gvr)
+
+	// Preflight list: if RBAC/list fails, WaitForCacheSync would hang forever and block
+	// Deployment/StatefulSet informer startup. Fail open by skipping Rollouts only.
+	listCtx, cancel := context.WithTimeout(ctx, rolloutListPreflightTO)
+	defer cancel()
+	if _, err := dynClient.Resource(gvr).Namespace(metav1.NamespaceAll).List(listCtx, metav1.ListOptions{Limit: 1}); err != nil {
+		logWarnf("Argo Rollouts API %s is present but listing Rollouts failed (%v); skipping Rollout PDB management so Deployment/StatefulSet management can proceed",
+			gvr.String(), err)
 		setRolloutSupport(nil, false)
 		return nil
 	}
 
 	setRolloutSupport(dynClient, true)
-	logInfof("Argo Rollouts CRD detected; enabling Rollout PDB management")
+	logInfof("Argo Rollouts API detected (%s); enabling Rollout PDB management", gvr.String())
 
 	factory := dynamicinformer.NewDynamicSharedInformerFactory(dynClient, 10*time.Minute)
-	informer := factory.ForResource(rolloutGVR).Informer()
+	informer := factory.ForResource(gvr).Informer()
 	informer.AddEventHandler(cache.ResourceEventHandlerFuncs{
 		AddFunc: func(obj interface{}) {
 			rw, err := rolloutFromInformerObj(obj)
@@ -212,7 +266,8 @@ func listRollouts(ctx context.Context, namespace string) ([]*rolloutWorkload, er
 	if !ok || dyn == nil {
 		return nil, nil
 	}
-	list, err := dyn.Resource(rolloutGVR).Namespace(namespace).List(ctx, metav1.ListOptions{})
+	gvr := getRolloutGVR()
+	list, err := dyn.Resource(gvr).Namespace(namespace).List(ctx, metav1.ListOptions{})
 	if err != nil {
 		return nil, err
 	}
@@ -230,10 +285,11 @@ func listRollouts(ctx context.Context, namespace string) ([]*rolloutWorkload, er
 
 func getRollout(ctx context.Context, namespace, name string) (*rolloutWorkload, error) {
 	dyn, ok := getRolloutSupport()
+	gvr := getRolloutGVR()
 	if !ok || dyn == nil {
-		return nil, apierrors.NewNotFound(schema.GroupResource{Group: rolloutGroup, Resource: rolloutResource}, name)
+		return nil, apierrors.NewNotFound(gvr.GroupResource(), name)
 	}
-	u, err := dyn.Resource(rolloutGVR).Namespace(namespace).Get(ctx, name, metav1.GetOptions{})
+	u, err := dyn.Resource(gvr).Namespace(namespace).Get(ctx, name, metav1.GetOptions{})
 	if err != nil {
 		return nil, err
 	}

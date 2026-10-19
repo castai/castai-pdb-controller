@@ -4,6 +4,8 @@ import (
 	"context"
 	"testing"
 
+	appsv1 "k8s.io/api/apps/v1"
+	corev1 "k8s.io/api/core/v1"
 	policyv1 "k8s.io/api/policy/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -111,6 +113,196 @@ func TestCreatePDBForWorkload_rollout(t *testing.T) {
 	}
 }
 
+func TestUpdateExistingPDB_rolloutUpdatesMinAvailable(t *testing.T) {
+	resetDefaultPDBConfig()
+	t.Cleanup(resetDefaultPDBConfig)
+
+	two := int32(2)
+	existing := &policyv1.PodDisruptionBudget{
+		ObjectMeta: metav1.ObjectMeta{Name: "castai-canary-api-pdb", Namespace: "default"},
+		Spec: policyv1.PodDisruptionBudgetSpec{
+			Selector:     &metav1.LabelSelector{MatchLabels: map[string]string{"app": "canary-api"}},
+			MinAvailable: &intstr.IntOrString{Type: intstr.Int, IntVal: 1},
+		},
+	}
+	clientset := fake.NewSimpleClientset(existing)
+	rw := &rolloutWorkload{
+		Namespace:         "default",
+		Name:              "canary-api",
+		Replicas:          &two,
+		Selector:          &metav1.LabelSelector{MatchLabels: map[string]string{"app": "canary-api"}},
+		PodTemplateLabels: map[string]string{"app": "canary-api"},
+		Annotations:       map[string]string{annotationMinAvailable: "2"},
+		ReadyReplicas:     2,
+		AvailableReplicas: 2,
+	}
+
+	updateExistingPDB(context.Background(), clientset, existing, rw.Annotations, &two, "default", "canary-api", rw)
+	got, err := clientset.PolicyV1().PodDisruptionBudgets("default").Get(context.Background(), "castai-canary-api-pdb", metav1.GetOptions{})
+	if err != nil {
+		t.Fatalf("get PDB: %v", err)
+	}
+	if got.Spec.MinAvailable == nil || got.Spec.MinAvailable.IntVal != 2 {
+		t.Fatalf("expected minAvailable=2, got %#v", got.Spec.MinAvailable)
+	}
+}
+
+func TestHandleWorkloadUpdate_rolloutBypassRemovesPDB(t *testing.T) {
+	resetDefaultPDBConfig()
+	t.Cleanup(resetDefaultPDBConfig)
+
+	two := int32(2)
+	existing := &policyv1.PodDisruptionBudget{
+		ObjectMeta: metav1.ObjectMeta{Name: "castai-canary-api-pdb", Namespace: "default"},
+		Spec: policyv1.PodDisruptionBudgetSpec{
+			Selector:     &metav1.LabelSelector{MatchLabels: map[string]string{"app": "canary-api"}},
+			MinAvailable: &intstr.IntOrString{Type: intstr.Int, IntVal: 1},
+		},
+	}
+	clientset := fake.NewSimpleClientset(existing)
+	oldRW := &rolloutWorkload{
+		Namespace: "default", Name: "canary-api", Replicas: &two,
+		Selector:          &metav1.LabelSelector{MatchLabels: map[string]string{"app": "canary-api"}},
+		PodTemplateLabels: map[string]string{"app": "canary-api"},
+	}
+	newRW := &rolloutWorkload{
+		Namespace: "default", Name: "canary-api", Replicas: &two,
+		Selector:          &metav1.LabelSelector{MatchLabels: map[string]string{"app": "canary-api"}},
+		PodTemplateLabels: map[string]string{"app": "canary-api"},
+		Annotations:       map[string]string{annotationBypass: "true"},
+	}
+
+	handleWorkloadUpdate(context.Background(), clientset, oldRW, newRW)
+	_, err := clientset.PolicyV1().PodDisruptionBudgets("default").Get(context.Background(), "castai-canary-api-pdb", metav1.GetOptions{})
+	if !apierrors.IsNotFound(err) {
+		t.Fatalf("expected PDB deleted on bypass, got err=%v", err)
+	}
+}
+
+func TestReconcileAllDefaultPDBs_createsForRollout(t *testing.T) {
+	resetDefaultPDBConfig()
+	t.Cleanup(resetDefaultPDBConfig)
+	t.Cleanup(func() { setRolloutSupport(nil, false) })
+
+	ns := &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: "default"}}
+	clientset := fake.NewSimpleClientset(ns)
+	u := newUnstructuredRollout("default", "canary-api", 2,
+		map[string]string{"app": "canary-api"},
+		map[string]string{"app": "canary-api"},
+		2, 2,
+	)
+	dyn := dynamicfake.NewSimpleDynamicClientWithCustomListKinds(
+		runtime.NewScheme(),
+		map[schema.GroupVersionResource]string{getRolloutGVR(): "RolloutList"},
+		u,
+	)
+	setRolloutSupport(dyn, true)
+
+	reconcileAllDefaultPDBs(context.Background(), clientset)
+	if _, err := clientset.PolicyV1().PodDisruptionBudgets("default").Get(context.Background(), "castai-canary-api-pdb", metav1.GetOptions{}); err != nil {
+		t.Fatalf("expected reconcile to create Rollout PDB: %v", err)
+	}
+}
+
+func TestScanAllPDBsForMultiplePDBs_rollout(t *testing.T) {
+	resetDefaultPDBConfig()
+	t.Cleanup(resetDefaultPDBConfig)
+	t.Cleanup(func() { setRolloutSupport(nil, false) })
+
+	ns := &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: "default"}}
+	helmPDB := &policyv1.PodDisruptionBudget{
+		ObjectMeta: metav1.ObjectMeta{Name: "castai-canary-api", Namespace: "default"},
+		Spec: policyv1.PodDisruptionBudgetSpec{
+			MinAvailable: &intstr.IntOrString{Type: intstr.Int, IntVal: 1},
+			Selector:     &metav1.LabelSelector{MatchLabels: map[string]string{"app": "canary-api"}},
+		},
+	}
+	leftover := &policyv1.PodDisruptionBudget{
+		ObjectMeta: metav1.ObjectMeta{Name: "castai-canary-api-pdb", Namespace: "default"},
+		Spec: policyv1.PodDisruptionBudgetSpec{
+			MinAvailable: &intstr.IntOrString{Type: intstr.Int, IntVal: 1},
+			Selector:     &metav1.LabelSelector{MatchLabels: map[string]string{"app": "canary-api"}},
+		},
+	}
+	clientset := fake.NewSimpleClientset(ns, helmPDB, leftover)
+	u := newUnstructuredRollout("default", "canary-api", 2,
+		map[string]string{"app": "canary-api"},
+		map[string]string{"app": "canary-api"},
+		2, 2,
+	)
+	dyn := dynamicfake.NewSimpleDynamicClientWithCustomListKinds(
+		runtime.NewScheme(),
+		map[schema.GroupVersionResource]string{getRolloutGVR(): "RolloutList"},
+		u,
+	)
+	setRolloutSupport(dyn, true)
+
+	scanAllPDBsForMultiplePDBs(context.Background(), clientset)
+	_, err := clientset.PolicyV1().PodDisruptionBudgets("default").Get(context.Background(), "castai-canary-api-pdb", metav1.GetOptions{})
+	if !apierrors.IsNotFound(err) {
+		t.Fatalf("expected leftover controller PDB deleted for Rollout, got err=%v", err)
+	}
+}
+
+func TestScanAllPDBsForPoorConfig_rollout(t *testing.T) {
+	resetDefaultPDBConfig()
+	t.Cleanup(resetDefaultPDBConfig)
+	t.Cleanup(func() { setRolloutSupport(nil, false) })
+
+	three := int32(3)
+	pdb := &policyv1.PodDisruptionBudget{
+		ObjectMeta: metav1.ObjectMeta{Name: "castai-canary-api-pdb", Namespace: "default"},
+		Spec: policyv1.PodDisruptionBudgetSpec{
+			MinAvailable: &intstr.IntOrString{Type: intstr.Int, IntVal: 3},
+			Selector:     &metav1.LabelSelector{MatchLabels: map[string]string{"app": "canary-api"}},
+		},
+	}
+	clientset := fake.NewSimpleClientset(pdb)
+	u := newUnstructuredRollout("default", "canary-api", three,
+		map[string]string{"app": "canary-api"},
+		map[string]string{"app": "canary-api"},
+		3, 3,
+	)
+	dyn := dynamicfake.NewSimpleDynamicClientWithCustomListKinds(
+		runtime.NewScheme(),
+		map[schema.GroupVersionResource]string{getRolloutGVR(): "RolloutList"},
+		u,
+	)
+	setRolloutSupport(dyn, true)
+
+	// Should not panic / error; poor-config path logs for matching Rollout selector.
+	scanAllPDBsForPoorConfig(context.Background(), clientset)
+}
+
+func TestPickGCWorkloadReplicas_prefersSelectorMatch(t *testing.T) {
+	t.Parallel()
+	one := int32(1)
+	three := int32(3)
+	pdb := &policyv1.PodDisruptionBudget{
+		ObjectMeta: metav1.ObjectMeta{Name: "castai-shared-pdb", Namespace: "default"},
+		Spec: policyv1.PodDisruptionBudgetSpec{
+			Selector: &metav1.LabelSelector{MatchLabels: map[string]string{"app": "rollout-app"}},
+		},
+	}
+	got := pickGCWorkloadReplicas(pdb, "shared", []gcWorkloadCandidate{
+		{
+			kind:              "Deployment",
+			replicas:          &one,
+			selector:          &metav1.LabelSelector{MatchLabels: map[string]string{"app": "deploy-app"}},
+			podTemplateLabels: map[string]string{"app": "deploy-app"},
+		},
+		{
+			kind:              "Rollout",
+			replicas:          &three,
+			selector:          &metav1.LabelSelector{MatchLabels: map[string]string{"app": "rollout-app"}},
+			podTemplateLabels: map[string]string{"app": "rollout-app"},
+		},
+	})
+	if got == nil || *got != 3 {
+		t.Fatalf("expected Rollout replicas=3, got %v", got)
+	}
+}
+
 func TestGarbageCollectOrphanedPDBs_keepsWhenRolloutExists(t *testing.T) {
 	resetDefaultPDBConfig()
 	t.Cleanup(resetDefaultPDBConfig)
@@ -132,7 +324,7 @@ func TestGarbageCollectOrphanedPDBs_keepsWhenRolloutExists(t *testing.T) {
 	)
 	dyn := dynamicfake.NewSimpleDynamicClientWithCustomListKinds(
 		runtime.NewScheme(),
-		map[schema.GroupVersionResource]string{rolloutGVR: "RolloutList"},
+		map[schema.GroupVersionResource]string{getRolloutGVR(): "RolloutList"},
 		u,
 	)
 	setRolloutSupport(dyn, true)
@@ -142,6 +334,47 @@ func TestGarbageCollectOrphanedPDBs_keepsWhenRolloutExists(t *testing.T) {
 	_, err := clientset.PolicyV1().PodDisruptionBudgets("default").Get(context.Background(), "castai-canary-api-pdb", metav1.GetOptions{})
 	if err != nil {
 		t.Fatalf("PDB should be kept while Rollout exists: %v", err)
+	}
+}
+
+func TestGarbageCollectOrphanedPDBs_nameCollisionUsesMatchingRollout(t *testing.T) {
+	resetDefaultPDBConfig()
+	t.Cleanup(resetDefaultPDBConfig)
+	t.Cleanup(func() { setRolloutSupport(nil, false) })
+
+	one := int32(1)
+	pdb := &policyv1.PodDisruptionBudget{
+		ObjectMeta: metav1.ObjectMeta{Name: "castai-shared-pdb", Namespace: "default"},
+		Spec: policyv1.PodDisruptionBudgetSpec{
+			MinAvailable: &intstr.IntOrString{Type: intstr.Int, IntVal: 1},
+			Selector:     &metav1.LabelSelector{MatchLabels: map[string]string{"app": "rollout-app"}},
+		},
+	}
+	// Same name as Rollout, but different selector and under-replicated — must not win.
+	dep := &appsv1.Deployment{
+		ObjectMeta: metav1.ObjectMeta{Name: "shared", Namespace: "default"},
+		Spec: appsv1.DeploymentSpec{
+			Replicas: &one,
+			Selector: &metav1.LabelSelector{MatchLabels: map[string]string{"app": "deploy-app"}},
+			Template: corev1.PodTemplateSpec{ObjectMeta: metav1.ObjectMeta{Labels: map[string]string{"app": "deploy-app"}}},
+		},
+	}
+	clientset := fake.NewSimpleClientset(pdb, dep)
+	u := newUnstructuredRollout("default", "shared", 3,
+		map[string]string{"app": "rollout-app"},
+		map[string]string{"app": "rollout-app"},
+		3, 3,
+	)
+	dyn := dynamicfake.NewSimpleDynamicClientWithCustomListKinds(
+		runtime.NewScheme(),
+		map[schema.GroupVersionResource]string{getRolloutGVR(): "RolloutList"},
+		u,
+	)
+	setRolloutSupport(dyn, true)
+
+	garbageCollectOrphanedPDBs(context.Background(), clientset)
+	if _, err := clientset.PolicyV1().PodDisruptionBudgets("default").Get(context.Background(), "castai-shared-pdb", metav1.GetOptions{}); err != nil {
+		t.Fatalf("PDB should be kept using matching Rollout replicas, got err=%v", err)
 	}
 }
 
@@ -166,7 +399,7 @@ func TestGarbageCollectOrphanedPDBs_deletesWhenRolloutUnderReplicated(t *testing
 	)
 	dyn := dynamicfake.NewSimpleDynamicClientWithCustomListKinds(
 		runtime.NewScheme(),
-		map[schema.GroupVersionResource]string{rolloutGVR: "RolloutList"},
+		map[schema.GroupVersionResource]string{getRolloutGVR(): "RolloutList"},
 		u,
 	)
 	setRolloutSupport(dyn, true)
@@ -194,7 +427,7 @@ func TestListRollouts_noopWhenSupportDisabled(t *testing.T) {
 func newUnstructuredRollout(namespace, name string, replicas int32, matchLabels, podLabels map[string]string, ready, available int32) *unstructured.Unstructured {
 	return &unstructured.Unstructured{
 		Object: map[string]interface{}{
-			"apiVersion": rolloutGroup + "/" + rolloutVersion,
+			"apiVersion": rolloutGroup + "/" + rolloutVersionPreferred,
 			"kind":       "Rollout",
 			"metadata": map[string]interface{}{
 				"namespace": namespace,
