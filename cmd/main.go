@@ -951,10 +951,17 @@ func runController(ctx context.Context, clientset *kubernetes.Clientset, restCon
 		DeleteFunc: func(obj interface{}) { deletePDBForWorkload(ctx, clientset, obj) },
 	})
 
-	setWorkloadListers(factory.Apps().V1().Deployments().Lister(), factory.Apps().V1().StatefulSets().Lister())
-
 	var rolloutSynced cache.InformerSynced
 	var stopRollouts context.CancelFunc
+	var stopRolloutsMu sync.Mutex
+	setStopRollouts := func(stop context.CancelFunc) {
+		stopRolloutsMu.Lock()
+		defer stopRolloutsMu.Unlock()
+		if stopRollouts != nil {
+			stopRollouts()
+		}
+		stopRollouts = stop
+	}
 	if restConfig != nil {
 		if dynClient, err := dynamic.NewForConfig(restConfig); err != nil {
 			logWarnf("Failed to create dynamic client for Argo Rollouts: %v; continuing without Rollout PDB management", err)
@@ -963,6 +970,8 @@ func runController(ctx context.Context, clientset *kubernetes.Clientset, restCon
 		}
 	}
 	defer func() {
+		stopRolloutsMu.Lock()
+		defer stopRolloutsMu.Unlock()
 		if stopRollouts != nil {
 			stopRollouts()
 		}
@@ -1075,17 +1084,27 @@ func runController(ctx context.Context, clientset *kubernetes.Clientset, restCon
 			panic("failed to sync informer cache")
 		}
 	}
+	// Install listers only after Deploy/STS caches are synced so same-name checks
+	// do not observe an empty cache during startup.
+	setWorkloadListers(factory.Apps().V1().Deployments().Lister(), factory.Apps().V1().StatefulSets().Lister())
+
 	// Rollout sync is best-effort: never block Deployment/StatefulSet management.
 	if rolloutSynced != nil {
 		syncCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
 		if !cache.WaitForCacheSync(syncCtx.Done(), rolloutSynced) {
-			logWarnf("Timed out waiting for Rollout informer sync; disabling Rollout handlers (CRD still known for GC/collision checks)")
+			logWarnf("Timed out waiting for Rollout informer sync; disabling Rollout handlers (CRD still known for GC/collision checks); will retry in background")
+			stopRolloutsMu.Lock()
 			if stopRollouts != nil {
 				stopRollouts()
+				stopRollouts = nil
 			}
+			stopRolloutsMu.Unlock()
 			disableRolloutInformer()
 		}
 		cancel()
+	}
+	if restConfig != nil {
+		go retryRolloutInformerPeriodically(ctx, clientset, restConfig, setStopRollouts)
 	}
 	<-ctx.Done()
 }
@@ -2105,6 +2124,9 @@ func scanAllPDBsForPoorConfig(ctx context.Context, clientset kubernetes.Interfac
 				}
 				// Compare selectors for semantic equivalence
 				if pdbSelector.String() == workloadSelector.String() {
+					if skipSameNameConflict(ctx, clientset, deploy.Namespace, deploy.Name, "Deployment") {
+						continue
+					}
 					replicas := int32(1)
 					if deploy.Spec.Replicas != nil {
 						replicas = *deploy.Spec.Replicas
@@ -2134,6 +2156,9 @@ func scanAllPDBsForPoorConfig(ctx context.Context, clientset kubernetes.Interfac
 				}
 				// Compare selectors for semantic equivalence
 				if pdbSelector.String() == workloadSelector.String() {
+					if skipSameNameConflict(ctx, clientset, sts.Namespace, sts.Name, "StatefulSet") {
+						continue
+					}
 					replicas := int32(1)
 					if sts.Spec.Replicas != nil {
 						replicas = *sts.Spec.Replicas
@@ -2158,6 +2183,9 @@ func scanAllPDBsForPoorConfig(ctx context.Context, clientset kubernetes.Interfac
 						continue
 					}
 					if pdbSelector.String() == workloadSelector.String() {
+						if skipSameNameConflict(ctx, clientset, r.Namespace, r.Name, "Rollout") {
+							continue
+						}
 						replicas := int32(1)
 						if r.Replicas != nil {
 							replicas = *r.Replicas

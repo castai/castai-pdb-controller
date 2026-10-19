@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"fmt"
 	"math"
 	"testing"
 
@@ -469,5 +470,20 @@ func TestRolloutExistsInStore(t *testing.T) {
 	exists, ok = rolloutExistsInStore("default", "missing")
 	if !ok || exists {
 		t.Fatalf("expected store miss, ok=%v exists=%v", ok, exists)
+	}
+}
+
+type errStore struct{ cache.Store }
+
+func (errStore) GetByKey(string) (interface{}, bool, error) {
+	return nil, false, fmt.Errorf("indexer boom")
+}
+
+func TestRolloutExistsInStore_errorFallsBack(t *testing.T) {
+	t.Cleanup(func() { setRolloutSupport(nil, false) })
+	setRolloutStore(errStore{Store: cache.NewStore(cache.MetaNamespaceKeyFunc)})
+	exists, ok := rolloutExistsInStore("default", "shared")
+	if ok || exists {
+		t.Fatalf("GetByKey error must force API fallback (ok=false), got ok=%v exists=%v", ok, exists)
 	}
 }

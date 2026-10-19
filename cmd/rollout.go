@@ -17,14 +17,16 @@ import (
 	"k8s.io/client-go/dynamic"
 	"k8s.io/client-go/dynamic/dynamicinformer"
 	"k8s.io/client-go/kubernetes"
+	"k8s.io/client-go/rest"
 	"k8s.io/client-go/tools/cache"
 )
 
 const (
-	rolloutGroup            = "argoproj.io"
-	rolloutVersionPreferred = "v1alpha1"
-	rolloutResource         = "rollouts"
-	rolloutListPreflightTO  = 10 * time.Second
+	rolloutGroup                 = "argoproj.io"
+	rolloutVersionPreferred      = "v1alpha1"
+	rolloutResource              = "rollouts"
+	rolloutListPreflightTO       = 10 * time.Second
+	rolloutInformerRetryInterval = 2 * time.Minute
 )
 
 // rolloutWorkload is a typed view of an Argo Rollout for PDB management.
@@ -96,7 +98,7 @@ func setRolloutStore(store cache.Store) {
 }
 
 // rolloutExistsInStore reports (exists, storeAvailable). When storeAvailable is false,
-// callers should fall back to a direct API get.
+// callers should fall back to a direct API get (including on GetByKey errors).
 func rolloutExistsInStore(namespace, name string) (exists bool, storeAvailable bool) {
 	rolloutSupportMu.RLock()
 	store := rolloutStore
@@ -106,7 +108,7 @@ func rolloutExistsInStore(namespace, name string) (exists bool, storeAvailable b
 	}
 	_, exists, err := store.GetByKey(namespace + "/" + name)
 	if err != nil {
-		return false, true
+		return false, false
 	}
 	return exists, true
 }
@@ -364,6 +366,54 @@ func maybeStartRolloutInformer(ctx context.Context, clientset kubernetes.Interfa
 	})
 	factory.Start(rolloutCtx.Done())
 	return informer.HasSynced, stopRollouts
+}
+
+// retryRolloutInformerPeriodically restarts the Rollout informer when the CRD is known
+// but the informer was disabled (sync timeout / preflight failure). Stops once enabled
+// or when ctx is cancelled.
+func retryRolloutInformerPeriodically(ctx context.Context, clientset kubernetes.Interface, restConfig *rest.Config, setStop func(context.CancelFunc)) {
+	if restConfig == nil {
+		return
+	}
+	ticker := time.NewTicker(rolloutInformerRetryInterval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			if rolloutInformerEnabled() || !rolloutCRDKnown() {
+				continue
+			}
+			dynClient, err := dynamic.NewForConfig(restConfig)
+			if err != nil {
+				logWarnf("Rollout informer retry: dynamic client failed: %v", err)
+				continue
+			}
+			synced, stop := maybeStartRolloutInformer(ctx, clientset, dynClient)
+			if synced == nil {
+				if stop != nil {
+					stop()
+				}
+				continue
+			}
+			syncCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
+			ok := cache.WaitForCacheSync(syncCtx.Done(), synced)
+			cancel()
+			if !ok {
+				logWarnf("Rollout informer retry: sync timed out; will try again in %s", rolloutInformerRetryInterval)
+				if stop != nil {
+					stop()
+				}
+				disableRolloutInformer()
+				continue
+			}
+			if setStop != nil {
+				setStop(stop)
+			}
+			logInfof("Rollout informer recovered after retry; Rollout PDB management active")
+		}
+	}
 }
 
 func listRollouts(ctx context.Context, namespace string) ([]*rolloutWorkload, error) {
