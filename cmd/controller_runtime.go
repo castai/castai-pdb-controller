@@ -67,6 +67,8 @@ func (rt *controllerRuntime) setRolloutSupport(client dynamic.Interface, enabled
 	rt.rolloutClient = client
 	rt.rolloutEnabled = true
 	rt.rolloutKnown = true
+	// Drop any prior store; the new informer installs a fresh one via setRolloutStore.
+	rt.rolloutStore = nil
 }
 
 // setRolloutCRDKnown records that the Rollouts API exists but leaves the informer off

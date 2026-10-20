@@ -379,7 +379,9 @@ func pdbSpecNeedsUpdate(existing, desired *policyv1.PodDisruptionBudgetSpec) boo
 	return false
 }
 
-// updateExistingPDB updates an existing castai PDB with new configuration
+// updateExistingPDB updates an existing castai PDB with new configuration.
+// Callers must already have resolved same-name collisions (e.g. via
+// skipSameNameConflict in createPDBForWorkload); this helper does not re-check.
 func updateExistingPDB(ctx context.Context, clientset kubernetes.Interface, rt *controllerRuntime, existingPDB *policyv1.PodDisruptionBudget, workloadAnnotations map[string]string, replicas *int32, namespace, name string, obj interface{}) {
 	if deleteCastaiPDBIfUnderReplicated(ctx, clientset, namespace, name, replicas) {
 		return

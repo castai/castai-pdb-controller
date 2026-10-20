@@ -173,8 +173,18 @@ func rolloutFromInformerObj(obj interface{}) (*rolloutWorkload, error) {
 	return parseRolloutWorkload(u)
 }
 
-func (rt *controllerRuntime) clearRolloutSupportIfAPIGone(err error) {
-	if err == nil || !meta.IsNoMatchError(err) {
+// clearRolloutSupportIfAPIGone disables Rollout management when the API type itself is gone.
+// fromList: List NotFound usually means the resource type/CRD was removed (safe to clear).
+// Get NotFound means the object is absent and must not clear support.
+func (rt *controllerRuntime) clearRolloutSupportIfAPIGone(err error, fromList bool) {
+	if err == nil {
+		return
+	}
+	gone := meta.IsNoMatchError(err)
+	if fromList && apierrors.IsNotFound(err) {
+		gone = true
+	}
+	if !gone {
 		return
 	}
 	logWarnf("Argo Rollouts API no longer available (%v); disabling Rollout PDB management", err)
@@ -331,7 +341,7 @@ func (rt *controllerRuntime) listRollouts(ctx context.Context, namespace string)
 	}
 	list, err := dyn.Resource(gvr).Namespace(namespace).List(ctx, metav1.ListOptions{})
 	if err != nil {
-		rt.clearRolloutSupportIfAPIGone(err)
+		rt.clearRolloutSupportIfAPIGone(err, true)
 		return nil, err
 	}
 	out := make([]*rolloutWorkload, 0, len(list.Items))
@@ -353,7 +363,8 @@ func (rt *controllerRuntime) getRollout(ctx context.Context, namespace, name str
 	}
 	u, err := dyn.Resource(gvr).Namespace(namespace).Get(ctx, name, metav1.GetOptions{})
 	if err != nil {
-		rt.clearRolloutSupportIfAPIGone(err)
+		// Object NotFound must not disable CRD support; only type-level NoMatch does.
+		rt.clearRolloutSupportIfAPIGone(err, false)
 		return nil, err
 	}
 	return parseRolloutWorkload(u)

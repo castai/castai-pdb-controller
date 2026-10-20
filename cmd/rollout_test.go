@@ -719,16 +719,54 @@ func TestClearRolloutSupportIfAPIGone(t *testing.T) {
 		map[schema.GroupVersionResource]string{rt.getRolloutGVR(): "RolloutList"},
 	)
 	rt.setRolloutSupport(dyn, true)
-	rt.clearRolloutSupportIfAPIGone(fmt.Errorf("some other error"))
+	rt.clearRolloutSupportIfAPIGone(fmt.Errorf("some other error"), true)
 	if !rt.rolloutCRDKnown() || !rt.rolloutInformerEnabled() {
 		t.Fatal("non-NoMatch errors must leave Rollout support enabled")
 	}
 
+	// Get-path NotFound is a missing object — must not disable CRD support.
+	rt.clearRolloutSupportIfAPIGone(apierrors.NewNotFound(rt.getRolloutGVR().GroupResource(), "missing"), false)
+	if !rt.rolloutCRDKnown() || !rt.rolloutInformerEnabled() {
+		t.Fatal("Get NotFound must not disable Rollout support")
+	}
+
+	// List-path NotFound typically means the resource type/CRD was removed.
+	rt.clearRolloutSupportIfAPIGone(apierrors.NewNotFound(rt.getRolloutGVR().GroupResource(), ""), true)
+	if rt.rolloutCRDKnown() || rt.rolloutInformerEnabled() {
+		t.Fatal("List NotFound must disable Rollout support")
+	}
+
+	rt.setRolloutSupport(dyn, true)
 	rt.clearRolloutSupportIfAPIGone(&meta.NoKindMatchError{
 		GroupKind: schema.GroupKind{Group: rolloutGroup, Kind: "Rollout"},
-	})
+	}, false)
 	if rt.rolloutCRDKnown() || rt.rolloutInformerEnabled() {
 		t.Fatal("NoMatchError must disable Rollout support")
+	}
+}
+
+func TestSetRolloutSupport_enabledClearsStaleStore(t *testing.T) {
+	rt := newControllerRuntime()
+	t.Cleanup(func() { rt.setRolloutSupport(nil, false) })
+
+	store := cache.NewStore(cache.MetaNamespaceKeyFunc)
+	u := newUnstructuredRollout("default", "stale", 2,
+		map[string]string{"app": "stale"},
+		map[string]string{"app": "stale"},
+		2, 2,
+	)
+	if err := store.Add(u); err != nil {
+		t.Fatal(err)
+	}
+	dyn := dynamicfake.NewSimpleDynamicClientWithCustomListKinds(
+		runtime.NewScheme(),
+		map[schema.GroupVersionResource]string{rt.getRolloutGVR(): "RolloutList"},
+	)
+	rt.setRolloutSupport(dyn, true)
+	rt.setRolloutStore(store)
+	rt.setRolloutSupport(dyn, true) // re-enable without disableRolloutInformer
+	if _, ok := rt.rolloutExistsInStore("default", "stale"); ok {
+		t.Fatal("enabled setRolloutSupport must clear stale store until setRolloutStore")
 	}
 }
 
