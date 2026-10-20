@@ -1,6 +1,6 @@
 ## CAST AI PDB Controller
 
-A custom Kubernetes controller that automatically manages [PodDisruptionBudgets (PDBs)](https://kubernetes.io/docs/tasks/run-application/configure-pdb/) for Deployments and StatefulSets using flexible, annotation-driven configuration.  
+A custom Kubernetes controller that automatically manages [PodDisruptionBudgets (PDBs)](https://kubernetes.io/docs/tasks/run-application/configure-pdb/) for Deployments, StatefulSets, and Argo Rollouts (when the Rollouts CRD is installed) using flexible, annotation-driven configuration.  
 This controller enables safe, automated disruption management with per-workload overrides and cluster-wide defaults.
 
 ---
@@ -8,7 +8,9 @@ This controller enables safe, automated disruption management with per-workload 
 ## Features
 
 - **Automatic PDB Creation/Update:**  
-  Ensures every eligible Deployment/StatefulSet has a PDB, using defaults or per-workload overrides.
+  Ensures every eligible Deployment/StatefulSet/Rollout has a PDB, using defaults or per-workload overrides.
+
+  **Rollout notes:** Only Rollouts with an inline `spec.selector` are supported (`workloadRef`-based Rollouts are skipped with a warning). PDB names remain `castai-<name>-pdb`. If a Deployment, StatefulSet, and/or Rollout share the same name in a namespace, the controller logs a warning and skips PDB management for those workloads. Garbage collection for an existing colliding PDB is conservative (keeps the PDB if any same-named owner still has ≥2 replicas). If the Argo Rollouts CRD is installed after the controller is already running, Rollout support is picked up on the background retry interval (no restart required).
 
 - **Annotation-Based Customization:**  
   Users can set `minAvailable`, `maxUnavailable`, or opt out of PDB management with annotations.
