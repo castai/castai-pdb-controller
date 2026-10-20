@@ -902,17 +902,16 @@ func loadDefaultPDBConfig(ctx context.Context, clientset *kubernetes.Clientset) 
 		return
 	}
 	logDebugf("Successfully loaded ConfigMap, updating config")
-	// Pre-leader load never reconciles; pass an empty runtime so updateDefaultPDBConfig
-	// never observes a nil dependency.
-	updateDefaultPDBConfig(ctx, cm, clientset, newControllerRuntime(), false)
+	// Pre-leader load never reconciles; nil rt is OK when reconcile=false.
+	updateDefaultPDBConfig(ctx, cm, clientset, nil, false)
 }
 
 // Runs the main controller loop to automatically create, update, and delete PodDisruptionBudgets for Deployments and StatefulSets in response to workload events and annotations.
 func runController(ctx context.Context, clientset *kubernetes.Clientset, restConfig *rest.Config) {
 	rt := newControllerRuntime()
-	// ConfigMap watch and initial poor-PDB scan must run only on the leader (GitHub #10).
+	// ConfigMap watch must run only on the leader (GitHub #10). Initial poor-PDB scan
+	// starts after listers are installed (see below) so it can use cache-local reads.
 	go watchConfigMap(ctx, clientset, rt)
-	go scanAllPDBsForPoorConfig(ctx, clientset, rt)
 
 	factory := informers.NewSharedInformerFactory(clientset, 10*time.Minute)
 
@@ -1085,6 +1084,9 @@ func runController(ctx context.Context, clientset *kubernetes.Clientset, restCon
 	if restConfig != nil {
 		go rt.retryRolloutInformerPeriodically(ctx, clientset, restConfig, setStopRollouts)
 	}
+	// Startup poor-PDB scan after Deploy/STS listers (and best-effort Rollout sync) so
+	// same-name conflict checks prefer cache-local reads over live API Gets.
+	go scanAllPDBsForPoorConfig(ctx, clientset, rt)
 	<-ctx.Done()
 }
 
@@ -1808,6 +1810,12 @@ func rolloutExistsForConflict(ctx context.Context, rt *controllerRuntime, namesp
 // event normally deletes the PDB the moment a workload scales down, but if that event is
 // ever missed (controller restart, leader-election gap, etc.) the PDB would otherwise
 // persist indefinitely with 0 allowed disruptions, blocking node drains/rotations.
+//
+// Same-name collisions (Deploy/STS/Rollout sharing a name) are unsupported: create/update
+// paths skip those workloads. For GC of an existing castai-<name>-pdb, replica decisions
+// use the max replicas among same-named owners (conservative keep) so we never delete a
+// PDB that a multi-replica owner might still need — even if the PDB selector only matches
+// a different low-replica owner. Prefer renaming colliding workloads.
 func garbageCollectOrphanedPDBs(ctx context.Context, clientset kubernetes.Interface, rt *controllerRuntime) {
 	pdbs, err := clientset.PolicyV1().PodDisruptionBudgets("").List(ctx, metav1.ListOptions{})
 	if err != nil {
@@ -1861,9 +1869,7 @@ func garbageCollectOrphanedPDBs(ctx context.Context, clientset kubernetes.Interf
 			continue
 		}
 
-		// Prefer an exact same-name owner that still exists. If multiple kinds share the
-		// name (unsupported), keep the highest replica count so we do not delete a PDB
-		// that a multi-replica owner still needs.
+		// Max replicas across same-named owners (see function comment).
 		var replicas *int32
 		if errDep == nil {
 			replicas = maxReplicasPtr(replicas, deploy.Spec.Replicas)
