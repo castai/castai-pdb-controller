@@ -141,6 +141,17 @@ func (rt *controllerRuntime) disableRolloutInformer() {
 	}
 }
 
+// preserveRolloutKnownOrClear keeps rolloutKnown when the CRD was already discovered
+// (disable informer only). Clears support only when the CRD was never known.
+func (rt *controllerRuntime) preserveRolloutKnownOrClear(reason string) {
+	if rt.rolloutCRDKnown() {
+		logWarnf("Argo Rollouts discovery miss (%s); keeping CRD known for GC/collision checks, informer disabled", reason)
+		rt.disableRolloutInformer()
+		return
+	}
+	rt.setRolloutSupport(nil, false)
+}
+
 func (rt *controllerRuntime) setRolloutStore(store cache.Store) {
 	rt.rolloutMu.Lock()
 	defer rt.rolloutMu.Unlock()

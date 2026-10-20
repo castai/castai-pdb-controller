@@ -1073,7 +1073,7 @@ func runController(ctx context.Context, clientset *kubernetes.Clientset, restCon
 // watches for changes to the custom annotations (min, max, and bypass)
 func handleWorkloadUpdate(ctx context.Context, clientset kubernetes.Interface, rt *controllerRuntime, oldObj, newObj interface{}) {
 	var oldAnnotations, newAnnotations map[string]string
-	var namespace, name string
+	var namespace, name, kind string
 
 	switch oldWorkload := oldObj.(type) {
 	case *appsv1.Deployment:
@@ -1082,18 +1082,21 @@ func handleWorkloadUpdate(ctx context.Context, clientset kubernetes.Interface, r
 		newAnnotations = newWorkload.Annotations
 		namespace = newWorkload.Namespace
 		name = newWorkload.Name
+		kind = "Deployment"
 	case *appsv1.StatefulSet:
 		oldAnnotations = oldWorkload.Annotations
 		newWorkload := newObj.(*appsv1.StatefulSet)
 		newAnnotations = newWorkload.Annotations
 		namespace = newWorkload.Namespace
 		name = newWorkload.Name
+		kind = "StatefulSet"
 	case *rolloutWorkload:
 		oldAnnotations = oldWorkload.Annotations
 		newWorkload := newObj.(*rolloutWorkload)
 		newAnnotations = newWorkload.Annotations
 		namespace = newWorkload.Namespace
 		name = newWorkload.Name
+		kind = "Rollout"
 	default:
 		return
 	}
@@ -1111,10 +1114,22 @@ func handleWorkloadUpdate(ctx context.Context, clientset kubernetes.Interface, r
 		}
 	}
 
-	// If bypass annotation is added, remove PDB
+	// If bypass annotation is added, remove PDB only when no same-named sibling remains
+	// (same guard as deletePDBForWorkload).
 	if !oldBypass && newBypass {
+		others, err := sameNameConflicts(ctx, clientset, rt, namespace, name, kind)
+		if err != nil {
+			logWarnf("Not deleting PDB castai-%s-pdb after bypass on %s %s/%s: cannot confirm name uniqueness: %v",
+				name, kind, namespace, name, err)
+			return
+		}
+		if len(others) > 0 {
+			logWarnf("Not deleting PDB castai-%s-pdb after bypass on %s %s/%s: %v still exist with the same name",
+				name, kind, namespace, name, others)
+			return
+		}
 		pdbName := fmt.Sprintf("castai-%s-pdb", name)
-		err := clientset.PolicyV1().PodDisruptionBudgets(namespace).Delete(ctx, pdbName, metav1.DeleteOptions{})
+		err = clientset.PolicyV1().PodDisruptionBudgets(namespace).Delete(ctx, pdbName, metav1.DeleteOptions{})
 		if err != nil && !apierrors.IsNotFound(err) {
 			logErrorf("Failed to delete PDB %s/%s after bypass annotation added: %v\n", namespace, pdbName, err)
 		} else {
@@ -1719,9 +1734,11 @@ func sameNameConflicts(ctx context.Context, clientset kubernetes.Interface, rt *
 	if selfKind != "Rollout" && rt.rolloutCRDKnown() {
 		exists, err := rolloutExistsForConflict(ctx, rt, namespace, name)
 		if err != nil {
-			return nil, fmt.Errorf("Rollout %s/%s: %w", namespace, name, err)
-		}
-		if exists {
+			// Rollout API unhealthy (RBAC/timeout) must not fail-close Deploy/STS PDB
+			// management — only skip the Rollout collision signal for this check.
+			logWarnf("Rollout conflict check for %s/%s failed (%v); proceeding without Rollout collision signal",
+				namespace, name, err)
+		} else if exists {
 			others = append(others, "Rollout")
 		}
 	}

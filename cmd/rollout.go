@@ -200,13 +200,17 @@ func (rt *controllerRuntime) maybeStartRolloutInformer(ctx context.Context, clie
 	if err != nil {
 		logWarnf("Failed to discover Argo Rollouts API (%s, resource=%s): %v; skipping Rollout PDB management",
 			rolloutGroup, rolloutResource, err)
-		rt.setRolloutSupport(nil, false)
+		// If the CRD was already known, do not clear known on a transient discovery
+		// error — that would let GC treat live Rollout PDBs as orphans.
+		rt.preserveRolloutKnownOrClear(fmt.Sprintf("discovery error: %v", err))
 		return nil, nil
 	}
 	if !available {
 		logInfof("Argo Rollouts API (%s, resource=%s) not found; skipping Rollout PDB management",
 			rolloutGroup, rolloutResource)
-		rt.setRolloutSupport(nil, false)
+		// Absence after previously-known: keep known until List NotFound clears support
+		// via clearRolloutSupportIfAPIGone (avoids rediscovery flakes orphaning PDBs).
+		rt.preserveRolloutKnownOrClear("API not listed by discovery")
 		return nil, nil
 	}
 	rt.setRolloutGVR(gvr)

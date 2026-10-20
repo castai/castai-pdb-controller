@@ -158,6 +158,82 @@ func TestSkipSameNameConflict_errorsFailClosed(t *testing.T) {
 	}
 }
 
+func TestSameNameConflicts_rolloutAPIErrorDoesNotBlockDeployment(t *testing.T) {
+	rt := newControllerRuntime()
+	t.Cleanup(func() { rt.setRolloutSupport(nil, false) })
+
+	dyn := dynamicfake.NewSimpleDynamicClientWithCustomListKinds(
+		runtime.NewScheme(),
+		map[schema.GroupVersionResource]string{rt.getRolloutGVR(): "RolloutList"},
+	)
+	rt.setRolloutSupport(dyn, true)
+	dyn.PrependReactor("get", "rollouts", func(action clienttesting.Action) (bool, runtime.Object, error) {
+		return true, nil, fmt.Errorf("rollouts.argoproj.io forbidden")
+	})
+
+	clientset := fake.NewSimpleClientset()
+	others, err := sameNameConflicts(context.Background(), clientset, rt, "default", "web", "Deployment")
+	if err != nil {
+		t.Fatalf("Deploy conflict check must not fail closed on Rollout API errors: %v", err)
+	}
+	if len(others) != 0 {
+		t.Fatalf("expected no conflicts, got %v", others)
+	}
+}
+
+func TestPreserveRolloutKnownOrClear_keepsKnownAfterDiscoveryMiss(t *testing.T) {
+	rt := newControllerRuntime()
+	t.Cleanup(func() { rt.setRolloutSupport(nil, false) })
+
+	dyn := dynamicfake.NewSimpleDynamicClientWithCustomListKinds(
+		runtime.NewScheme(),
+		map[schema.GroupVersionResource]string{rt.getRolloutGVR(): "RolloutList"},
+	)
+	rt.setRolloutSupport(dyn, true)
+	rt.preserveRolloutKnownOrClear("discovery flake")
+	if !rt.rolloutCRDKnown() {
+		t.Fatal("previously-known CRD must stay known after discovery miss")
+	}
+	if rt.rolloutInformerEnabled() {
+		t.Fatal("informer must be disabled after discovery miss")
+	}
+}
+
+func TestHandleWorkloadUpdate_bypassKeepsPDBWhenSameNamedSiblingExists(t *testing.T) {
+	rt := newControllerRuntime()
+	resetDefaultPDBConfig()
+	t.Cleanup(resetDefaultPDBConfig)
+	t.Cleanup(func() { rt.setRolloutSupport(nil, false) })
+
+	pdb := &policyv1.PodDisruptionBudget{
+		ObjectMeta: metav1.ObjectMeta{Name: "castai-shared-pdb", Namespace: "default"},
+		Spec: policyv1.PodDisruptionBudgetSpec{
+			Selector:     &metav1.LabelSelector{MatchLabels: map[string]string{"app": "shared"}},
+			MinAvailable: &intstr.IntOrString{Type: intstr.Int, IntVal: 1},
+		},
+	}
+	depOld := &appsv1.Deployment{ObjectMeta: metav1.ObjectMeta{Name: "shared", Namespace: "default"}}
+	depNew := depOld.DeepCopy()
+	depNew.Annotations = map[string]string{annotationBypass: "true"}
+	u := newUnstructuredRollout("default", "shared", 2,
+		map[string]string{"app": "shared"},
+		map[string]string{"app": "shared"},
+		2, 2,
+	)
+	clientset := fake.NewSimpleClientset(pdb, depOld)
+	dyn := dynamicfake.NewSimpleDynamicClientWithCustomListKinds(
+		runtime.NewScheme(),
+		map[schema.GroupVersionResource]string{rt.getRolloutGVR(): "RolloutList"},
+		u,
+	)
+	rt.setRolloutSupport(dyn, true)
+
+	handleWorkloadUpdate(context.Background(), clientset, rt, depOld, depNew)
+	if _, err := clientset.PolicyV1().PodDisruptionBudgets("default").Get(context.Background(), "castai-shared-pdb", metav1.GetOptions{}); err != nil {
+		t.Fatalf("bypass on Deploy must not delete PDB while same-named Rollout exists: %v", err)
+	}
+}
+
 func TestCreatePDBForWorkload_skipsOnSameNameConflict(t *testing.T) {
 	rt := newControllerRuntime()
 	resetDefaultPDBConfig()
