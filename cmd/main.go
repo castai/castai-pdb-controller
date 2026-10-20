@@ -932,30 +932,14 @@ func runController(ctx context.Context, clientset *kubernetes.Clientset, restCon
 	})
 
 	var rolloutSynced cache.InformerSynced
-	var stopRollouts context.CancelFunc
-	var stopRolloutsMu sync.Mutex
-	setStopRollouts := func(stop context.CancelFunc) {
-		stopRolloutsMu.Lock()
-		defer stopRolloutsMu.Unlock()
-		if stopRollouts != nil {
-			stopRollouts()
-		}
-		stopRollouts = stop
-	}
 	if restConfig != nil {
 		if dynClient, err := dynamic.NewForConfig(restConfig); err != nil {
 			logWarnf("Failed to create dynamic client for Argo Rollouts: %v; continuing without Rollout PDB management", err)
 		} else {
-			rolloutSynced, stopRollouts = rt.maybeStartRolloutInformer(ctx, clientset, dynClient)
+			rolloutSynced, _ = rt.maybeStartRolloutInformer(ctx, clientset, dynClient)
 		}
 	}
-	defer func() {
-		stopRolloutsMu.Lock()
-		defer stopRolloutsMu.Unlock()
-		if stopRollouts != nil {
-			stopRollouts()
-		}
-	}()
+	defer rt.stopRolloutInformer()
 
 	// Periodically scan for poor and multiple PDBs
 	go func() {
@@ -1073,18 +1057,12 @@ func runController(ctx context.Context, clientset *kubernetes.Clientset, restCon
 		syncCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
 		if !cache.WaitForCacheSync(syncCtx.Done(), rolloutSynced) {
 			logWarnf("Timed out waiting for Rollout informer sync; disabling Rollout handlers (CRD still known for GC/collision checks); will retry in background")
-			stopRolloutsMu.Lock()
-			if stopRollouts != nil {
-				stopRollouts()
-				stopRollouts = nil
-			}
-			stopRolloutsMu.Unlock()
 			rt.disableRolloutInformer()
 		}
 		cancel()
 	}
 	if restConfig != nil {
-		go rt.retryRolloutInformerPeriodically(ctx, clientset, restConfig, setStopRollouts)
+		go rt.retryRolloutInformerPeriodically(ctx, clientset, restConfig, nil)
 	}
 	// Leader-only ConfigMap watch + startup scan once caches/runtime are ready (GitHub #10).
 	go watchConfigMap(ctx, clientset, rt)

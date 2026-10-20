@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"sync"
 
 	"k8s.io/apimachinery/pkg/runtime/schema"
@@ -23,6 +24,7 @@ type controllerRuntime struct {
 	rolloutKnown   bool // CRD discovered; GC must not treat Rollouts as absent
 	rolloutStore   cache.Store
 	rolloutGVR     schema.GroupVersionResource
+	rolloutStop    context.CancelFunc // cancels the active Rollout informer context
 }
 
 func newControllerRuntime() *controllerRuntime {
@@ -54,41 +56,89 @@ func (rt *controllerRuntime) getSTSLister() appsv1listers.StatefulSetLister {
 	return rt.stsLister
 }
 
+// takeRolloutStop clears and returns the informer cancel func (caller invokes it unlocked).
+func (rt *controllerRuntime) takeRolloutStopLocked() context.CancelFunc {
+	stop := rt.rolloutStop
+	rt.rolloutStop = nil
+	return stop
+}
+
 func (rt *controllerRuntime) setRolloutSupport(client dynamic.Interface, enabled bool) {
 	rt.rolloutMu.Lock()
-	defer rt.rolloutMu.Unlock()
+	var stop context.CancelFunc
 	if !enabled {
+		stop = rt.takeRolloutStopLocked()
 		rt.rolloutClient = nil
 		rt.rolloutEnabled = false
 		rt.rolloutKnown = false
 		rt.rolloutStore = nil
+		rt.rolloutMu.Unlock()
+		if stop != nil {
+			stop()
+		}
 		return
 	}
+	// Replacing an active informer: cancel the previous one first.
+	stop = rt.takeRolloutStopLocked()
 	rt.rolloutClient = client
 	rt.rolloutEnabled = true
 	rt.rolloutKnown = true
 	// Drop any prior store; the new informer installs a fresh one via setRolloutStore.
 	rt.rolloutStore = nil
+	rt.rolloutMu.Unlock()
+	if stop != nil {
+		stop()
+	}
+}
+
+// setRolloutInformerStop records the cancel func for the active Rollout informer.
+// Any previously registered stop is cancelled first.
+func (rt *controllerRuntime) setRolloutInformerStop(stop context.CancelFunc) {
+	rt.rolloutMu.Lock()
+	prev := rt.takeRolloutStopLocked()
+	rt.rolloutStop = stop
+	rt.rolloutMu.Unlock()
+	if prev != nil {
+		prev()
+	}
+}
+
+// stopRolloutInformer cancels the active Rollout informer if any.
+func (rt *controllerRuntime) stopRolloutInformer() {
+	rt.rolloutMu.Lock()
+	stop := rt.takeRolloutStopLocked()
+	rt.rolloutMu.Unlock()
+	if stop != nil {
+		stop()
+	}
 }
 
 // setRolloutCRDKnown records that the Rollouts API exists but leaves the informer off
 // (e.g. preflight list failed). GC and same-name checks can still use the client.
 func (rt *controllerRuntime) setRolloutCRDKnown(client dynamic.Interface) {
 	rt.rolloutMu.Lock()
-	defer rt.rolloutMu.Unlock()
+	stop := rt.takeRolloutStopLocked()
 	rt.rolloutClient = client
 	rt.rolloutKnown = true
 	rt.rolloutEnabled = false
 	rt.rolloutStore = nil
+	rt.rolloutMu.Unlock()
+	if stop != nil {
+		stop()
+	}
 }
 
 // disableRolloutInformer keeps the CRD "known" for GC/collision lookups but stops
-// treating the informer as active (e.g. after a sync timeout).
+// treating the informer as active (e.g. after a sync timeout) and cancels its context.
 func (rt *controllerRuntime) disableRolloutInformer() {
 	rt.rolloutMu.Lock()
-	defer rt.rolloutMu.Unlock()
+	stop := rt.takeRolloutStopLocked()
 	rt.rolloutEnabled = false
 	rt.rolloutStore = nil
+	rt.rolloutMu.Unlock()
+	if stop != nil {
+		stop()
+	}
 }
 
 func (rt *controllerRuntime) setRolloutStore(store cache.Store) {

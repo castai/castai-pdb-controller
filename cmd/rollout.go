@@ -224,6 +224,7 @@ func (rt *controllerRuntime) maybeStartRolloutInformer(ctx context.Context, clie
 
 	rolloutCtx, stopRollouts := context.WithCancel(ctx)
 	rt.setRolloutSupport(dynClient, true)
+	rt.setRolloutInformerStop(stopRollouts)
 	logInfof("Argo Rollouts API detected (%s); enabling Rollout PDB management", gvr.String())
 
 	factory := dynamicinformer.NewDynamicSharedInformerFactory(dynClient, 10*time.Minute)
@@ -310,9 +311,7 @@ func (rt *controllerRuntime) retryRolloutInformerPeriodically(ctx context.Contex
 		cancel()
 		if !ok {
 			logWarnf("Rollout informer retry: sync timed out; will try again with jittered backoff")
-			if stop != nil {
-				stop()
-			}
+			// disableRolloutInformer cancels the informer context registered on rt.
 			rt.disableRolloutInformer()
 			return false
 		}

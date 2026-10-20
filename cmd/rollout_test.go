@@ -770,9 +770,16 @@ func TestClearRolloutSupportIfAPIGone(t *testing.T) {
 	}
 
 	// List-path NotFound typically means the resource type/CRD was removed.
+	stopped := make(chan struct{})
+	rt.setRolloutInformerStop(func() { close(stopped) })
 	rt.clearRolloutSupportIfAPIGone(apierrors.NewNotFound(rt.getRolloutGVR().GroupResource(), ""), true)
 	if rt.rolloutCRDKnown() || rt.rolloutInformerEnabled() {
 		t.Fatal("List NotFound must disable Rollout support")
+	}
+	select {
+	case <-stopped:
+	default:
+		t.Fatal("List NotFound must cancel the Rollout informer context")
 	}
 
 	rt.setRolloutSupport(dyn, true)
