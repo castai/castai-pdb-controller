@@ -119,6 +119,45 @@ func TestCreatePDBForWorkload_rolloutSkipsNilSelector(t *testing.T) {
 	}
 }
 
+// workloadRef (nil selector) must not delete an existing castai PDB when under-replicated.
+func TestCreatePDBForWorkload_nilSelectorRolloutDoesNotDeleteExistingPDB(t *testing.T) {
+	rt := newControllerRuntime()
+	resetDefaultPDBConfig()
+	t.Cleanup(resetDefaultPDBConfig)
+
+	one := int32(1)
+	pdb := &policyv1.PodDisruptionBudget{
+		ObjectMeta: metav1.ObjectMeta{Name: "castai-shared-pdb", Namespace: "default"},
+		Spec: policyv1.PodDisruptionBudgetSpec{
+			Selector:     &metav1.LabelSelector{MatchLabels: map[string]string{"app": "shared"}},
+			MinAvailable: &intstr.IntOrString{Type: intstr.Int, IntVal: 1},
+		},
+	}
+	clientset := fake.NewSimpleClientset(pdb)
+	rw := &rolloutWorkload{
+		Namespace: "default", Name: "shared", Replicas: &one,
+		Selector: nil, ReadyReplicas: 1, AvailableReplicas: 1,
+	}
+	createPDBForWorkload(context.Background(), clientset, rt, rw)
+	if _, err := clientset.PolicyV1().PodDisruptionBudgets("default").Get(context.Background(), "castai-shared-pdb", metav1.GetOptions{}); err != nil {
+		t.Fatalf("nil-selector Rollout must not delete existing PDB: %v", err)
+	}
+}
+
+func TestSkipSameNameConflict_errorsFailClosed(t *testing.T) {
+	rt := newControllerRuntime()
+	t.Cleanup(func() { rt.setWorkloadListers(nil, nil) })
+
+	clientset := fake.NewSimpleClientset()
+	clientset.Fake.PrependReactor("get", "deployments", func(action clienttesting.Action) (bool, runtime.Object, error) {
+		return true, nil, fmt.Errorf("apiserver unavailable")
+	})
+
+	if !skipSameNameConflict(context.Background(), clientset, rt, "default", "app", "Rollout") {
+		t.Fatal("conflict-check errors must skip PDB management (fail closed)")
+	}
+}
+
 func TestCreatePDBForWorkload_skipsOnSameNameConflict(t *testing.T) {
 	rt := newControllerRuntime()
 	resetDefaultPDBConfig()

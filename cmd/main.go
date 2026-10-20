@@ -911,9 +911,9 @@ func loadDefaultPDBConfig(ctx context.Context, clientset *kubernetes.Clientset) 
 // Runs the main controller loop to automatically create, update, and delete PodDisruptionBudgets for Deployments and StatefulSets in response to workload events and annotations.
 func runController(ctx context.Context, clientset *kubernetes.Clientset, restConfig *rest.Config) {
 	rt := newControllerRuntime()
-	// ConfigMap watch must run only on the leader (GitHub #10). Initial poor-PDB scan
-	// starts after listers are installed (see below) so it can use cache-local reads.
-	go watchConfigMap(ctx, clientset, rt)
+	// ConfigMap watch / reconcile and the initial poor-PDB scan start after listers and
+	// best-effort Rollout setup (see end of this function) so early ConfigMap updates
+	// do not race an uninitialized runtime.
 
 	factory := informers.NewSharedInformerFactory(clientset, 10*time.Minute)
 
@@ -1086,8 +1086,8 @@ func runController(ctx context.Context, clientset *kubernetes.Clientset, restCon
 	if restConfig != nil {
 		go rt.retryRolloutInformerPeriodically(ctx, clientset, restConfig, setStopRollouts)
 	}
-	// Startup poor-PDB scan after Deploy/STS listers (and best-effort Rollout sync) so
-	// same-name conflict checks prefer cache-local reads over live API Gets.
+	// Leader-only ConfigMap watch + startup scan once caches/runtime are ready (GitHub #10).
+	go watchConfigMap(ctx, clientset, rt)
 	go scanAllPDBsForPoorConfig(ctx, clientset, rt)
 	<-ctx.Done()
 }
@@ -1346,6 +1346,12 @@ func createPDBForWorkload(ctx context.Context, clientset kubernetes.Interface, r
 		logDebugf("Workload %s/%s is NOT excluded", namespace, name)
 	case *rolloutWorkload:
 		namespace, name = workload.Namespace, workload.Name
+		// workloadRef Rollouts have no inline selector — skip before conflict/delete logic
+		// so we never remove a castai-<name>-pdb owned by another kind.
+		if workload.Selector == nil {
+			logWarnf("Skipping PDB for Rollout %s/%s: empty spec.selector (workloadRef-based Rollouts are not supported)", namespace, name)
+			return
+		}
 		if skipSameNameConflict(ctx, clientset, rt, namespace, name, "Rollout") {
 			return
 		}
@@ -1371,9 +1377,6 @@ func createPDBForWorkload(ctx context.Context, clientset kubernetes.Interface, r
 	}
 
 	if selector == nil {
-		if _, isRollout := obj.(*rolloutWorkload); isRollout {
-			logWarnf("Skipping PDB for Rollout %s/%s: empty spec.selector (workloadRef-based Rollouts are not supported)", namespace, name)
-		}
 		return
 	}
 
@@ -1694,15 +1697,15 @@ func deletePDBForWorkload(ctx context.Context, clientset kubernetes.Interface, r
 	}
 }
 
-// skipSameNameConflict logs and returns true when another managed kind shares namespace/name.
-// Transient API errors are logged but do not skip create/update (only confirmed conflicts do).
-// PDB names are castai-<name>-pdb (kind-agnostic).
+// skipSameNameConflict logs and returns true when another managed kind shares namespace/name,
+// or when the conflict check itself errors (fail closed so we never create/update a PDB
+// while uniqueness is unknown). PDB names are castai-<name>-pdb (kind-agnostic).
 func skipSameNameConflict(ctx context.Context, clientset kubernetes.Interface, rt *controllerRuntime, namespace, name, selfKind string) bool {
 	others, err := sameNameConflicts(ctx, clientset, rt, namespace, name, selfKind)
 	if err != nil {
-		logWarnf("Proceeding with PDB management for %s %s/%s despite name-conflict check error: %v",
+		logWarnf("Skipping PDB management for %s %s/%s: cannot confirm name uniqueness: %v",
 			selfKind, namespace, name, err)
-		return false
+		return true
 	}
 	if len(others) > 0 {
 		logWarnf("Skipping PDB management for %s %s/%s: same name also used by %v; rename one workload or manage its PDB manually",

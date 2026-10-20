@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"math"
+	"math/rand"
 	"time"
 
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
@@ -272,10 +273,17 @@ func (rt *controllerRuntime) maybeStartRolloutInformer(ctx context.Context, clie
 	return informer.HasSynced, stopRollouts
 }
 
+// rolloutInformerRetryWait returns the base retry interval plus up to 50% jitter so
+// controllers that restart together do not stampede discovery/list in sync.
+func rolloutInformerRetryWait() time.Duration {
+	jitter := time.Duration(rand.Int63n(int64(rolloutInformerRetryInterval/2) + 1))
+	return rolloutInformerRetryInterval + jitter
+}
+
 // retryRolloutInformerPeriodically keeps trying to enable the Rollout informer until
 // it is active or ctx is cancelled. Covers: CRD installed after controller start,
-// preflight list failure, and initial sync timeout. Tries immediately, then every
-// rolloutInformerRetryInterval.
+// preflight list failure, and initial sync timeout. Tries immediately, then waits
+// rolloutInformerRetryInterval plus jitter between attempts.
 func (rt *controllerRuntime) retryRolloutInformerPeriodically(ctx context.Context, clientset kubernetes.Interface, restConfig *rest.Config, setStop func(context.CancelFunc)) {
 	if restConfig == nil {
 		return
@@ -301,7 +309,7 @@ func (rt *controllerRuntime) retryRolloutInformerPeriodically(ctx context.Contex
 		ok := cache.WaitForCacheSync(syncCtx.Done(), synced)
 		cancel()
 		if !ok {
-			logWarnf("Rollout informer retry: sync timed out; will try again in %s", rolloutInformerRetryInterval)
+			logWarnf("Rollout informer retry: sync timed out; will try again with jittered backoff")
 			if stop != nil {
 				stop()
 			}
@@ -320,13 +328,14 @@ func (rt *controllerRuntime) retryRolloutInformerPeriodically(ctx context.Contex
 		return
 	}
 
-	ticker := time.NewTicker(rolloutInformerRetryInterval)
-	defer ticker.Stop()
 	for {
+		wait := rolloutInformerRetryWait()
+		timer := time.NewTimer(wait)
 		select {
 		case <-ctx.Done():
+			timer.Stop()
 			return
-		case <-ticker.C:
+		case <-timer.C:
 			if attempt() {
 				return
 			}

@@ -102,12 +102,11 @@ func (rt *controllerRuntime) setRolloutStore(store cache.Store) {
 // Deploy/STS handlers during initial Rollout informer sync (including GetByKey errors).
 func (rt *controllerRuntime) rolloutExistsInStore(namespace, name string) (exists bool, storeAvailable bool) {
 	rt.rolloutMu.RLock()
-	store := rt.rolloutStore
-	rt.rolloutMu.RUnlock()
-	if store == nil {
+	defer rt.rolloutMu.RUnlock()
+	if rt.rolloutStore == nil {
 		return false, false
 	}
-	_, exists, err := store.GetByKey(namespace + "/" + name)
+	_, exists, err := rt.rolloutStore.GetByKey(namespace + "/" + name)
 	if err != nil {
 		return false, false
 	}
@@ -118,12 +117,11 @@ func (rt *controllerRuntime) rolloutExistsInStore(namespace, name string) (exist
 // unavailable store, or parse failure — callers should fall back to the API.
 func (rt *controllerRuntime) getRolloutFromStore(namespace, name string) (rw *rolloutWorkload, ok bool) {
 	rt.rolloutMu.RLock()
-	store := rt.rolloutStore
-	rt.rolloutMu.RUnlock()
-	if store == nil {
+	defer rt.rolloutMu.RUnlock()
+	if rt.rolloutStore == nil {
 		return nil, false
 	}
-	obj, exists, err := store.GetByKey(namespace + "/" + name)
+	obj, exists, err := rt.rolloutStore.GetByKey(namespace + "/" + name)
 	if err != nil || !exists {
 		return nil, false
 	}
